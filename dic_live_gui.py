@@ -582,7 +582,7 @@ class DICLive(QtWidgets.QMainWindow):
             combined = np.hstack((disp,legend))
             Hc,Wc,_ = combined.shape
             img = QtGui.QImage(combined.data,Wc,Hc,3*Wc,QtGui.QImage.Format_BGR888)
-            self.video_label.setPixmap( 
+            self.video_label.setPixmap(
                 QtGui.QPixmap.fromImage(img).scaled(
                     self.video_label.size(),
                     QtCore.Qt.KeepAspectRatio,
