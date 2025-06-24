@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # ------------------------------------------------------------------
-# Live-DIC GUI  –  Robust full implementation with recording & FPS
+# Live-DIC GUI  –  with dual‐format recording
 # ------------------------------------------------------------------
-import sys, time, traceback
+import sys, os, time, traceback
 import cv2
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -16,11 +16,10 @@ def to_qimage(bgr: np.ndarray) -> QtGui.QImage:
     return QtGui.QImage(rgb.data, w, h, w*3, QtGui.QImage.Format_RGB888)
 
 def norm_uint8(arr, vmin, vmax):
-    if vmax - vmin == 0:
-        vmax += 1e-6
+    if vmax - vmin == 0: vmax += 1e-6
     out = np.clip((arr - vmin)/(vmax - vmin), 0, 1)
     out[np.isnan(out)] = 0
-    return (out*255).astype(np.uint8)
+    return (out * 255).astype(np.uint8)
 
 # ------------------------- RTSP grabber
 class Grabber(QtCore.QThread):
@@ -29,14 +28,12 @@ class Grabber(QtCore.QThread):
         super().__init__()
         self.url = url
         self.keep_running = True
-
     def run(self):
         while self.keep_running:
             cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             if not cap.isOpened():
-                time.sleep(1)
-                continue
+                time.sleep(1); continue
             while self.keep_running and cap.isOpened():
                 ok, frame = cap.read()
                 if ok:
@@ -44,7 +41,6 @@ class Grabber(QtCore.QThread):
                 else:
                     time.sleep(0.02)
             cap.release()
-
     def stop(self):
         self.keep_running = False
         self.wait()
@@ -55,14 +51,14 @@ class DICLive(QtWidgets.QMainWindow):
         super().__init__()
         self.setWindowTitle("Live-DIC GUI – UI-1220ME-M-GL")
 
-        # --- DIC state
+        # DIC state
         self.cur = None
         self.roi = None
         self.mask_full = None
         self.mask_roi  = None
         self.ref_gray  = None
-        self.ref_pts   = None   # (N,1,2)
-        self.cum_disp  = None   # (N,2)
+        self.ref_pts   = None
+        self.cum_disp  = None
         self.facet, self.step = 21, 15
         self.scale_mm = 1.0
         self.frame_cnt = 0
@@ -75,17 +71,17 @@ class DICLive(QtWidgets.QMainWindow):
 
         # recording & FPS
         self.recording = False
-        self.recorder = None
+        self.recorder  = None
         self._last_fps_time = time.time()
         self._fps_counter  = 0
         self.fps = 0.0
 
         # --- UI widgets
-        self.view = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
-        self.info = QtWidgets.QLabel("Waiting for stream…", alignment=QtCore.Qt.AlignCenter)
-        self.disp = QtWidgets.QLabel("", alignment=QtCore.Qt.AlignCenter)
+        self.view      = QtWidgets.QLabel(alignment=QtCore.Qt.AlignCenter)
+        self.info      = QtWidgets.QLabel("Waiting for stream…", alignment=QtCore.Qt.AlignCenter)
+        self.disp      = QtWidgets.QLabel("", alignment=QtCore.Qt.AlignCenter)
         self.gauge_lbl = QtWidgets.QLabel("", alignment=QtCore.Qt.AlignCenter)
-        self.lbl_fps = QtWidgets.QLabel("FPS: 0.0", alignment=QtCore.Qt.AlignCenter)
+        self.lbl_fps   = QtWidgets.QLabel("FPS: 0.0", alignment=QtCore.Qt.AlignCenter)
 
         # Buttons
         self.btn_roi    = QtWidgets.QPushButton("Select ROI")
@@ -99,6 +95,10 @@ class DICLive(QtWidgets.QMainWindow):
         self.btn_cal    = QtWidgets.QPushButton("Calibrate")
         self.btn_gauge  = QtWidgets.QPushButton("Select Gauge Points")
         self.btn_rec    = QtWidgets.QPushButton("Start Recording")
+
+        # Format selector
+        self.combo_rec_format = QtWidgets.QComboBox()
+        self.combo_rec_format.addItems(["Uncompressed AVI", "MP4 H.264"])
 
         # Controls
         self.spin_facet  = QtWidgets.QSpinBox(); self.spin_facet.setRange(5,201); self.spin_facet.setValue(self.facet)
@@ -125,8 +125,8 @@ class DICLive(QtWidgets.QMainWindow):
         form = QtWidgets.QFormLayout()
         for row in [
             (self.combo_mode,),
-            ("Facet px:", self.spin_facet),
-            ("Step px:", self.spin_step),
+            ("Facet px:",  self.spin_facet),
+            ("Step px:",   self.spin_step),
             (self.btn_auto,),
             (self.btn_manual,),
             (self.btn_roi,),
@@ -138,13 +138,14 @@ class DICLive(QtWidgets.QMainWindow):
             (self.btn_cal,),
             (self.btn_gauge,),
             (self.btn_rec,),
-            ("FPS:", self.lbl_fps),
-            ("Metric:", self.combo_met),
+            ("Rec Format:", self.combo_rec_format),
+            ("FPS:",       self.lbl_fps),
+            ("Metric:",    self.combo_met),
             (self.chk_auto,),
             (self.chk_freeze,),
-            ("vmin:", self.spin_vmin),
-            ("vmax:", self.spin_vmax),
-            ("Opacity:", self.spin_alpha),
+            ("vmin:",      self.spin_vmin),
+            ("vmax:",      self.spin_vmax),
+            ("Opacity:",   self.spin_alpha),
             ("Disp-smooth ksize:", self.spin_ks),
             ("Colormap-blur ksize:", self.spin_cmblur),
             (self.chk_facets,),
@@ -160,21 +161,22 @@ class DICLive(QtWidgets.QMainWindow):
                 form.addRow(row[0])
         side = QtWidgets.QVBoxLayout(); side.addLayout(form); side.addStretch()
         main = QtWidgets.QHBoxLayout(); main.addWidget(self.view,3); main.addLayout(side,1)
-        w = QtWidgets.QWidget(); w.setLayout(main); self.setCentralWidget(w)
+        container = QtWidgets.QWidget(); container.setLayout(main)
+        self.setCentralWidget(container)
         self.setMinimumWidth(1100)
 
         # Signals
-        self.btn_roi.clicked.connect(self.select_roi)
-        self.btn_mrect.clicked.connect(lambda: self.draw_mask("rect"))
-        self.btn_mcirc.clicked.connect(lambda: self.draw_mask("circ"))
-        self.btn_mpoly.clicked.connect(lambda: self.draw_mask("poly"))
+        self.btn_roi.   clicked.connect(self.select_roi)
+        self.btn_mrect. clicked.connect(lambda: self.draw_mask("rect"))
+        self.btn_mcirc. clicked.connect(lambda: self.draw_mask("circ"))
+        self.btn_mpoly. clicked.connect(lambda: self.draw_mask("poly"))
         self.btn_clear.clicked.connect(self.clear_mask)
-        self.btn_auto.clicked.connect(self.auto_seed)
+        self.btn_auto.  clicked.connect(self.auto_seed)
         self.btn_manual.clicked.connect(self.manual_seed)
-        self.btn_ref.clicked.connect(self.set_reference)
-        self.btn_cal.clicked.connect(self.calibrate)
-        self.btn_gauge.clicked.connect(self.select_gauge)
-        self.btn_rec.clicked.connect(self.toggle_record)
+        self.btn_ref.   clicked.connect(self.set_reference)
+        self.btn_cal.   clicked.connect(self.calibrate)
+        self.btn_gauge. clicked.connect(self.select_gauge)
+        self.btn_rec.   clicked.connect(self.toggle_record)
         self.combo_mode.currentTextChanged.connect(self.apply_mode)
 
         # RTSP grabber
@@ -183,27 +185,38 @@ class DICLive(QtWidgets.QMainWindow):
         self.grabber.start()
 
         # Timer
-        self.timer = QtCore.QTimer(); self.timer.timeout.connect(self.process); self.timer.start(30)
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.process)
+        self.timer.start(30)
 
-    # ----------------- slot: toggle recording
+    # -------- recording toggle
     def toggle_record(self):
         if not self.recording:
-            fname, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Recording", "", "AVI (*.avi);;MP4 (*.mp4)")
-            if fname:
-                ext = fname.split('.')[-1].lower()
-                fourcc = cv2.VideoWriter_fourcc(*('mp4v' if ext=='mp4' else 'MJPG'))
-                # compute vis size
-                h, w = self.cur.shape[:2]
-                vis_w = w + 100
-                vis_h = h
-                fps = max(1, int(self.fps))  # fallback
-                self.recorder = cv2.VideoWriter(fname, fourcc, fps, (vis_w, vis_h))
-                if not self.recorder.isOpened():
-                    self.info.setText("Failed to open video file")
-                else:
-                    self.recording = True
-                    self.btn_rec.setText("Stop Recording")
-                    self.info.setText(f"Recording → {fname}")
+            fmt = self.combo_rec_format.currentText()
+            if fmt == "Uncompressed AVI":
+                filters = "AVI (*.avi)"
+            else:
+                filters = "MP4 H.264 (*.mp4)"
+            fname, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Recording", "", filters)
+            if not fname:
+                return
+            ext = os.path.splitext(fname)[1].lower()
+            if fmt == "Uncompressed AVI":
+                fourcc = 0
+            else:
+                fourcc = cv2.VideoWriter_fourcc(*"H264")
+            # estimate size from current frame + legend
+            h, w = self.cur.shape[:2]
+            vw = w + 100
+            vh = h
+            fps = max(1, int(self.fps))
+            self.recorder = cv2.VideoWriter(fname, fourcc, fps, (vw, vh))
+            if not self.recorder.isOpened():
+                self.info.setText("Failed to open file for recording")
+            else:
+                self.recording = True
+                self.btn_rec.setText("Stop Recording")
+                self.info.setText(f"Recording → {fname}")
         else:
             self.recording = False
             if self.recorder:
@@ -212,12 +225,12 @@ class DICLive(QtWidgets.QMainWindow):
             self.btn_rec.setText("Start Recording")
             self.info.setText("Recording stopped")
 
-    # ----------------- UI callbacks
+    # -------- UI callbacks
     def apply_mode(self):
         m = self.combo_mode.currentText()
-        if m=="Performance":
+        if m == "Performance":
             self.spin_facet.setValue(21); self.spin_step.setValue(20)
-        elif m=="Accuracy":
+        elif m == "Accuracy":
             self.spin_facet.setValue(41); self.spin_step.setValue(10)
         else:
             self.spin_facet.setValue(41); self.spin_step.setValue(20)
@@ -229,12 +242,10 @@ class DICLive(QtWidgets.QMainWindow):
         cv2.destroyAllWindows()
         if w>0 and h>0:
             self.roi = (x,y,w,h)
-            if self.mask_full is not None:
-                self.mask_roi = self.mask_full[y:y+h, x:x+w]
+            self.mask_roi = (self.mask_full[y:y+h, x:x+w] if self.mask_full is not None else None)
             self.ref_gray = None
             self.info.setText(f"ROI set: {self.roi}")
 
-    # ----------------- Mask
     def _ensure_mask(self):
         if self.cur is not None and self.mask_full is None:
             H,W = self.cur.shape[:2]
@@ -261,11 +272,12 @@ class DICLive(QtWidgets.QMainWindow):
                 if k==27: pts=[]; break
             cv2.destroyAllWindows()
             if len(pts)==2:
-                (cx,cy),(px,py)=pts; r=int(np.hypot(px-cx,py-cy))
+                (cx,cy),(px,py) = pts
+                r = int(np.hypot(px-cx, py-cy))
                 self._ensure_mask()
                 Y,X = np.ogrid[:img.shape[0],:img.shape[1]]
                 self.mask_full |= ((X-cx)**2 + (Y-cy)**2 <= r*r)
-        else:  # polygon
+        else:  # poly
             def cb(evt, xx, yy, flags, prm):
                 if evt==cv2.EVENT_LBUTTONDOWN:
                     pts.append((xx,yy)); cv2.circle(img,(xx,yy),3,(0,0,255),-1)
@@ -274,12 +286,11 @@ class DICLive(QtWidgets.QMainWindow):
             cv2.namedWindow("Mask Poly"); cv2.setMouseCallback("Mask Poly", cb)
             while True:
                 cv2.imshow("Mask Poly", img)
-                if cv2.waitKey(1)&0xFF==ord('c'): break
+                if cv2.waitKey(1)&0xFF == ord('c'): break
             cv2.destroyAllWindows()
             if len(pts)>=3:
                 self._ensure_mask()
                 cv2.fillPoly(self.mask_full,[np.array(pts,np.int32)],True)
-
         x,y,w,h = self.roi
         self.mask_roi = self.mask_full[y:y+h, x:x+w]
         self.info.setText("Mask updated")
@@ -289,17 +300,14 @@ class DICLive(QtWidgets.QMainWindow):
         self.mask_roi  = None
         self.info.setText("Mask cleared")
 
-    # ----------------- Seeding
     def auto_seed(self):
         if self.cur is None or self.roi is None:
             self.info.setText("Define ROI first"); return
         x,y,w,h = self.roi
         gray = cv2.cvtColor(self.cur, cv2.COLOR_BGR2GRAY)[y:y+h, x:x+w]
         mask = (self.mask_full[y:y+h, x:x+w] if self.mask_full is not None else None)
-        self.facet = self.spin_facet.value()
-        self.step  = self.spin_step.value()
-        half    = self.facet//2
-
+        self.facet,self.step = self.spin_facet.value(), self.spin_step.value()
+        half = self.facet//2
         qual = np.zeros_like(gray,bool)
         for cy in range(half, h-half, half):
             for cx in range(half, w-half, half):
@@ -313,20 +321,17 @@ class DICLive(QtWidgets.QMainWindow):
                 qual[cy-half:cy+half, cx-half:cx+half] = True
         if mask is not None:
             qual &= ~mask
-
         pts = [(cx,cy) for cy in range(half,h-half+1,self.step)
-                     for cx in range(half,w-half+1,self.step)
-                     if qual[cy,cx]]
+                      for cx in range(half,w-half+1,self.step)
+                      if qual[cy,cx]]
         if not pts:
             self.info.setText("No speckle seeds found"); return
-
         self.ref_pts  = np.array(pts,np.float32).reshape(-1,1,2)
         self.cum_disp = np.zeros((len(self.ref_pts),2), np.float32)
         self.info.setText(f"Auto seeds: {len(pts)}")
 
     def manual_seed(self):
-        if self.cur is None or self.roi is None:
-            return
+        if self.cur is None or self.roi is None: return
         img = self.cur.copy(); pts=[]
         def cb(evt, xx, yy, flags, prm):
             if evt==cv2.EVENT_LBUTTONDOWN:
@@ -346,7 +351,6 @@ class DICLive(QtWidgets.QMainWindow):
             self.cum_disp = np.zeros((len(self.ref_pts),2), np.float32)
             self.info.setText(f"Manual seeds: {len(pts)}")
 
-    # ----------------- Gauge
     def select_gauge(self):
         if self.cur is None or self.roi is None:
             self.info.setText("Define ROI first"); return
@@ -363,12 +367,11 @@ class DICLive(QtWidgets.QMainWindow):
         cv2.destroyAllWindows()
         if len(pts)==2:
             self.gauge_pts = pts
-            dx = pts[1][0]-pts[0][0]; dy = pts[1][1]-pts[0][1]
-            L0_pix = np.hypot(dx,dy)
-            self.gauge_L0_mm = L0_pix * self.scale_mm
+            dx,dy = pts[1][0]-pts[0][0], pts[1][1]-pts[0][1]
+            L0 = np.hypot(dx,dy)
+            self.gauge_L0_mm = L0 * self.scale_mm
             self.gauge_lbl.setText(f"Gauge L₀ = {self.gauge_L0_mm:.3f} mm")
 
-    # ----------------- Reference
     def set_reference(self):
         try:
             if self.cur is None or self.roi is None or self.ref_pts is None:
@@ -383,7 +386,6 @@ class DICLive(QtWidgets.QMainWindow):
         except Exception as e:
             self.info.setText(f"Ref error: {e}")
 
-    # ----------------- Calibration
     def calibrate(self):
         if self.cur is None:
             return
@@ -400,18 +402,17 @@ class DICLive(QtWidgets.QMainWindow):
         cv2.destroyAllWindows()
         if len(pts)==2:
             (x1,y1),(x2,y2)=pts
-            pix=np.hypot(x2-x1,y2-y1)
-            mm, ok = QtWidgets.QInputDialog.getDouble(self,"Real dist (mm)","mm:",10,1e-6,1e6,3)
+            pix = np.hypot(x2-x1, y2-y1)
+            mm,ok = QtWidgets.QInputDialog.getDouble(self,"Real dist (mm)","mm:",10,1e-6,1e6,3)
             if ok and pix>0:
                 self.scale_mm = mm/pix
                 self.info.setText(f"Scale = {self.scale_mm:.6f} mm/pix")
 
-    # ----------------- Main DIC loop
     def process(self):
         if self.cur is None:
             return
 
-        # FPS counter
+        # FPS
         self._fps_counter += 1
         now = time.time()
         if now - self._last_fps_time >= 1.0:
@@ -438,56 +439,51 @@ class DICLive(QtWidgets.QMainWindow):
             return
 
         try:
-            # optical flow
+            # optical flow & cumulative update
             self.frame_cnt += 1
             gray = cv2.cvtColor(self.cur, cv2.COLOR_BGR2GRAY)
             x0,y0,w,h = self.roi
             if w < self.facet*2 or h < self.facet*2:
                 self.info.setText("ROI too small"); return
-
             cur_roi = gray[y0:y0+h, x0:x0+w]
             lk = dict(winSize=(self.facet,self.facet), maxLevel=3,
                       criteria=(cv2.TERM_CRITERIA_EPS|cv2.TERM_CRITERIA_COUNT,30,0.01))
-            new,st,_ = cv2.calcOpticalFlowPyrLK(
-                self.ref_gray, cur_roi, self.ref_pts, None, **lk)
+            new,st,_ = cv2.calcOpticalFlowPyrLK(self.ref_gray, cur_roi,
+                                               self.ref_pts, None, **lk)
             st = st.reshape(-1)
             if not st.any():
                 self.info.setText("All points lost"); return
 
-            # cumulative update
             old_pts = self.ref_pts.reshape(-1,2)
             new_pts = new.reshape(-1,2)
             delta   = (new_pts - old_pts).astype(np.float32)
             rigid   = np.nanmean(delta, axis=0)
             delta  -= rigid
-            delta *= st.reshape(-1,1)            # zero out lost
+            delta *= st.reshape(-1,1)
             self.cum_disp += delta
 
-            # differential ref
             if self.chk_diff.isChecked() and self.frame_cnt >= self.spin_int.value():
                 self.ref_gray = cur_roi.copy()
                 self.ref_pts[st==1] = new[st==1].reshape(-1,1,2)
                 self.frame_cnt = 0
                 self.frozen = False
 
-            # build dense disp maps
+            # dense disp maps
             ux = np.zeros((h,w), np.float32)
             uy = np.zeros((h,w), np.float32)
             wt = np.zeros((h,w), np.float32)
             for (p,), d in zip(self.ref_pts, self.cum_disp):
                 iy,ix = int(p[1]), int(p[0])
                 if 0<=iy<h and 0<=ix<w:
-                    ux[iy,ix] = d[0]*self.scale_mm
-                    uy[iy,ix] = d[1]*self.scale_mm
-                    wt[iy,ix] = 1
+                    ux[iy,ix], uy[iy,ix], wt[iy,ix] = d[0]*self.scale_mm, d[1]*self.scale_mm, 1
 
-            # smooth displacement
+            # smooth disp
             k = self.spin_ks.value()|1
             k = min(k, (min(h,w)-1)|1)
             ux = cv2.GaussianBlur(ux,(k,k),0)/(cv2.GaussianBlur(wt,(k,k),0)+1e-6)
             uy = cv2.GaussianBlur(uy,(k,k),0)/(cv2.GaussianBlur(wt,(k,k),0)+1e-6)
 
-            # strains
+            # compute strains + total disp
             sp = self.scale_mm
             exx = np.gradient(ux,sp,axis=1)
             eyy = np.gradient(uy,sp,axis=0)
@@ -514,28 +510,22 @@ class DICLive(QtWidgets.QMainWindow):
                 field,unit = ux,"mm"
             elif metric=="Disp Y (mm)":
                 field,unit = uy,"mm"
-            else:  # Total Displacement
-                field = np.hypot(ux,uy)
+            else:
+                field = np.hypot(ux, uy)
                 unit = "mm"
 
-            # update gauge line
+            # gauge line deformation
             if self.gauge_pts and self.gauge_L0_mm:
                 (gx1,gy1),(gx2,gy2) = self.gauge_pts
-                # compute shifted endpoints
                 rx,ry,_w,_h = self.roi
-                # ROI coords
                 ry1,rx1 = gy1-ry, gx1-rx
                 ry2,rx2 = gy2-ry, gx2-rx
-                if (0<=ry1<h and 0<=rx1<w) and (0<=ry2<h and 0<=rx2<w):
-                    # pixel shift = disp_mm / scale_mm
-                    dpx1 = ux[ry1,rx1]/self.scale_mm
-                    dpy1 = uy[ry1,rx1]/self.scale_mm
-                    dpx2 = ux[ry2,rx2]/self.scale_mm
-                    dpy2 = uy[ry2,rx2]/self.scale_mm
-                    p1 = (int(gx1 + dpx1), int(gy1 + dpy1))
-                    p2 = (int(gx2 + dpx2), int(gy2 + dpy2))
+                if 0<=ry1<h and 0<=rx1<w and 0<=ry2<h and 0<=rx2<w:
+                    dp1x,dp1y = ux[ry1,rx1]/self.scale_mm, uy[ry1,rx1]/self.scale_mm
+                    dp2x,dp2y = ux[ry2,rx2]/self.scale_mm, uy[ry2,rx2]/self.scale_mm
+                    p1 = (int(gx1+dp1x), int(gy1+dp1y))
+                    p2 = (int(gx2+dp2x), int(gy2+dp2y))
                     cv2.line(vis, p1, p2, (0,255,255), 2)
-                # gauge label set below in legend
 
             # auto/freeze scale
             if self.chk_auto.isChecked():
@@ -554,21 +544,21 @@ class DICLive(QtWidgets.QMainWindow):
                     self.spin_vmin.setValue(self.vmin)
                     self.spin_vmax.setValue(self.vmax)
                     self.frozen = False
-            vmin,vmax = ((self.spin_vmin.value(), self.spin_vmax.value())
-                         if not self.chk_auto.isChecked()
-                         else (self.vmin, self.vmax))
+            if not self.chk_auto.isChecked():
+                vmin,vmax = self.spin_vmin.value(), self.spin_vmax.value()
+            else:
+                vmin,vmax = self.vmin, self.vmax
 
-            # overlay
-            cm = cv2.applyColorMap(norm_uint8(field,vmin,vmax), cv2.COLORMAP_JET)
-            # colormap blur
+            # color map overlay
+            cm = cv2.applyColorMap(norm_uint8(field, vmin, vmax), cv2.COLORMAP_JET)
             k2 = self.spin_cmblur.value()|1
             if k2>1:
                 cm = cv2.GaussianBlur(cm,(k2,k2),0)
             alpha = self.spin_alpha.value()
             vis[y0:y0+h, x0:x0+w] = cv2.addWeighted(cm, alpha,
-                                                   vis[y0:y0+h, x0:x0+w],1-alpha,0)
+                                                   vis[y0:y0+h, x0:x0+w], 1-alpha,0)
 
-            # assemble legend
+            # legend
             H = vis.shape[0]
             bar = norm_uint8(np.linspace(vmax,vmin,H,np.float32), vmin,vmax)
             bar = cv2.applyColorMap(bar.reshape(H,1), cv2.COLORMAP_JET)
@@ -586,7 +576,7 @@ class DICLive(QtWidgets.QMainWindow):
                         cx,cy = int(p[0]+x0), int(p[1]+y0)
                         cv2.rectangle(vis,(cx-half,cy-half),(cx+half,cy+half),(0,255,0),1)
 
-            # record if needed
+            # record
             if self.recording and self.recorder:
                 try:
                     self.recorder.write(vis)
@@ -594,8 +584,9 @@ class DICLive(QtWidgets.QMainWindow):
                     self.info.setText(f"Record error: {e}")
 
             # display
-            self.view.setPixmap(QtGui.QPixmap.fromImage(to_qimage(vis)).scaled(
-                self.view.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+            self.view.setPixmap(QtGui.QPixmap.fromImage(
+                to_qimage(vis)).scaled(self.view.size(),
+                QtCore.Qt.KeepAspectRatio,QtCore.Qt.SmoothTransformation))
             self.disp.setText(f"Tracked pts: {int(st.sum())}")
 
         except cv2.error as e:
@@ -609,9 +600,8 @@ class DICLive(QtWidgets.QMainWindow):
             self.recorder.release()
         super().closeEvent(ev)
 
-
 # ------------------------- entry point
-if __name__=="__main__":
+if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
     gui = DICLive()
     gui.resize(1200,700)
