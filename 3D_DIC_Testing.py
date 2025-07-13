@@ -1,4 +1,4 @@
-# UPGRADE: Add SolidWorks-like mouse controls for 3D navigation
+# UPGRADE: Add Z-Displacement display and RGB live footage overlay
 import sys
 import numpy as np
 import pyrealsense2 as rs
@@ -13,7 +13,7 @@ class RealSense3DDIC(QtWidgets.QWidget):
         self.gl_widget = gl.GLViewWidget()
         self.gl_widget.setBackgroundColor('k')
         self.gl_widget.opts['distance'] = 2
-        self.gl_widget.orbit(0, 0)  # reset view
+        self.gl_widget.orbit(0, 0)
         self.scatter = gl.GLScatterPlotItem(size=1)
         self.seeds_visual = gl.GLScatterPlotItem(size=6, color=(1,0.5,0,1))
         self.gl_widget.addItem(self.scatter)
@@ -21,13 +21,12 @@ class RealSense3DDIC(QtWidgets.QWidget):
 
         layout = QtWidgets.QVBoxLayout()
         self.dropdown = QtWidgets.QComboBox()
-        self.dropdown.addItems(['Equivalent Strain', 'X-Strain', 'Y-Strain', 'X-Displacement', 'Y-Displacement'])
+        self.dropdown.addItems(['Equivalent Strain', 'X-Strain', 'Y-Strain', 'Z-Displacement', 'X-Displacement', 'Y-Displacement', 'RGB Live Overlay'])
         self.dropdown.currentIndexChanged.connect(self.change_mode)
         layout.addWidget(self.dropdown)
         layout.addWidget(self.gl_widget, stretch=1)
         self.setLayout(layout)
 
-        # Enable mouse interaction similar to SolidWorks
         self.gl_widget.setMouseTracking(True)
         self.gl_widget.mousePressEvent = self.mouse_press
         self.gl_widget.mouseMoveEvent = self.mouse_move
@@ -116,6 +115,7 @@ class RealSense3DDIC(QtWidgets.QWidget):
             flow = cv2.calcOpticalFlowFarneback(self.prev_frame, gray_image, None, 0.5, 3, 15, 3, 5, 1.2, 0)
             dx = cv2.GaussianBlur(flow[..., 0], (3, 3), 0)
             dy = cv2.GaussianBlur(flow[..., 1], (3, 3), 0)
+            dz = verts[:, 2].reshape(gray_image.shape)
             exx = np.gradient(dx, axis=1)
             eyy = np.gradient(dy, axis=0)
             equiv_strain = np.sqrt(exx ** 2 + eyy ** 2)
@@ -130,6 +130,12 @@ class RealSense3DDIC(QtWidgets.QWidget):
                 selected_map = np.abs(dx)
             elif self.mode == 'Y-Displacement':
                 selected_map = np.abs(dy)
+            elif self.mode == 'Z-Displacement':
+                selected_map = np.abs(dz)
+            elif self.mode == 'RGB Live Overlay':
+                cv2.imshow('RGB Live Feed', color_image)
+                cv2.waitKey(1)
+                selected_map = np.zeros_like(dx)
             else:
                 selected_map = np.sqrt(dx**2 + dy**2)
 
@@ -158,6 +164,7 @@ class RealSense3DDIC(QtWidgets.QWidget):
     def closeEvent(self, event):
         try:
             self.pipeline.stop()
+            cv2.destroyAllWindows()
         except Exception as e:
             print(f'[WARNING] Failed to stop pipeline cleanly: {e}')
         event.accept()
