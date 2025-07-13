@@ -1,186 +1,170 @@
+# UPGRADE: Add SolidWorks-like mouse controls for 3D navigation
 import sys
-import time
-import cv2
 import numpy as np
 import pyrealsense2 as rs
-from PyQt5 import QtCore, QtGui, QtWidgets
+import cv2
+from PyQt5 import QtWidgets, QtCore
+import pyqtgraph.opengl as gl
 
-DEPTH_SCALE = 1000.0
-FACET_SIZE = 21
-STEP_SIZE = 30
-REF_ACCUM_FRAMES = 5  # number of frames to accumulate reference
-
-class RealSenseThread(QtCore.QThread):
-    frame_ready = QtCore.pyqtSignal(np.ndarray, np.ndarray)
-    def __init__(self, fps):
-        super().__init__()
-        self.pipeline = rs.pipeline()
-        self.config = rs.config()
-        self.fps = fps
-        self.started = False
-        self.running = True
-
-    def run(self):
-        try:
-            self.config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, self.fps)
-            self.config.enable_stream(rs.stream.color, 1280, 720, rs.format.y8, self.fps)
-            align = rs.align(rs.stream.color)
-            self.pipeline.start(self.config)
-            self.started = True
-            sensor = self.pipeline.get_active_profile().get_device().first_color_sensor()
-            sensor.set_option(rs.option.enable_auto_exposure, 1)
-            sensor.set_option(rs.option.power_line_frequency, 1)
-            while self.running:
-                frames = self.pipeline.wait_for_frames()
-                aligned = align.process(frames)
-                depth = np.asanyarray(aligned.get_depth_frame().get_data()) / DEPTH_SCALE
-                color = np.asanyarray(aligned.get_color_frame().get_data())
-                self.frame_ready.emit(color, depth)
-        except Exception as e:
-            print(f"[ERROR] RealSense thread error: {e}")
-        finally:
-            if self.started:
-                try:
-                    self.pipeline.stop()
-                except Exception as e:
-                    print(f"[ERROR] Failed to stop RealSense pipeline: {e}")
-
-    def stop(self):
-        self.running = False
-        self.wait()
-
-class DIC3DApp(QtWidgets.QWidget):
+class RealSense3DDIC(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Live 3D DIC - Intel D435i')
-        self.img_label = QtWidgets.QLabel()
-        self.img_label.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding)
-        self.img_label.setAlignment(QtCore.Qt.AlignCenter)
-
-        self.display_selector = QtWidgets.QComboBox()
-        self.display_selector.addItems(['Displacement magnitude', 'Strain magnitude'])
-
-        self.fps_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
-        self.fps_slider.setMinimum(6)
-        self.fps_slider.setMaximum(60)
-        self.fps_slider.setValue(30)
-        self.allowed_fps = [6, 15, 30, 60]
-
-        self.fps_timer = QtCore.QTimer()
-        self.fps_timer.setSingleShot(True)
-        self.fps_slider.valueChanged.connect(self.schedule_fps_update)
-        self.fps_timer.timeout.connect(self.update_fps)
-
-        self.roi_button = QtWidgets.QPushButton('Select ROI')
-        self.roi_button.clicked.connect(self.select_roi)
+        self.setWindowTitle('Intel RealSense 3D DIC Viewer')
+        self.gl_widget = gl.GLViewWidget()
+        self.gl_widget.setBackgroundColor('k')
+        self.gl_widget.opts['distance'] = 2
+        self.gl_widget.orbit(0, 0)  # reset view
+        self.scatter = gl.GLScatterPlotItem(size=1)
+        self.seeds_visual = gl.GLScatterPlotItem(size=6, color=(1,0.5,0,1))
+        self.gl_widget.addItem(self.scatter)
+        self.gl_widget.addItem(self.seeds_visual)
 
         layout = QtWidgets.QVBoxLayout()
-        layout.addWidget(self.img_label)
-        layout.addWidget(QtWidgets.QLabel('Display Mode:'))
-        layout.addWidget(self.display_selector)
-        layout.addWidget(QtWidgets.QLabel('FPS (allowed: 6,15,30,60):'))
-        layout.addWidget(self.fps_slider)
-        layout.addWidget(self.roi_button)
+        self.dropdown = QtWidgets.QComboBox()
+        self.dropdown.addItems(['Equivalent Strain', 'X-Strain', 'Y-Strain', 'X-Displacement', 'Y-Displacement'])
+        self.dropdown.currentIndexChanged.connect(self.change_mode)
+        layout.addWidget(self.dropdown)
+        layout.addWidget(self.gl_widget, stretch=1)
         self.setLayout(layout)
 
-        self.ref_gray = None
-        self.ref_accum = None
-        self.ref_count = 0
-        self.ref_pts = None
-        self.roi = None
-        self.thread = RealSenseThread(fps=self.fps_slider.value())
-        self.thread.frame_ready.connect(self.process_frame)
-        self.thread.start()
+        # Enable mouse interaction similar to SolidWorks
+        self.gl_widget.setMouseTracking(True)
+        self.gl_widget.mousePressEvent = self.mouse_press
+        self.gl_widget.mouseMoveEvent = self.mouse_move
+        self.gl_widget.mouseReleaseEvent = self.mouse_release
+        self._mouse_pressed = False
+        self._last_pos = None
 
-    def schedule_fps_update(self):
-        self.fps_timer.start(1000)
+        self.pipeline = rs.pipeline()
+        cfg = rs.config()
+        cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
+        cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+        self.profile = self.pipeline.start(cfg)
 
-    def update_fps(self):
-        fps_value = min(self.allowed_fps, key=lambda x: abs(x - self.fps_slider.value()))
-        self.fps_slider.setEnabled(False)
+        sensor = self.profile.get_device().query_sensors()[0]
+        if sensor.supports(rs.option.power_line_frequency):
+            sensor.set_option(rs.option.power_line_frequency, rs.power_line_frequency.fifty_hz)
+
+        self.pc = rs.pointcloud()
+        self.align = rs.align(rs.stream.color)
+        self.prev_frame = None
+        self.mode = 'Equivalent Strain'
+        self.seed_step = 30
+        self.seed_history = []
+        self.smoothing_window = 5
+
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.update_data)
+        self.timer.start(30)
+
+    def mouse_press(self, event):
+        self._mouse_pressed = True
+        self._last_pos = event.pos()
+
+    def mouse_move(self, event):
+        if self._mouse_pressed:
+            dx = event.x() - self._last_pos.x()
+            dy = event.y() - self._last_pos.y()
+            self.gl_widget.orbit(-dx, dy)
+            self._last_pos = event.pos()
+
+    def mouse_release(self, event):
+        self._mouse_pressed = False
+
+    def change_mode(self, index):
+        self.mode = self.dropdown.currentText()
+
+    def auto_seed_points(self, shape):
+        h, w = shape
+        pts = np.array([[x, y] for y in range(0, h, self.seed_step) for x in range(0, w, self.seed_step)], np.float32)
+        return pts
+
+    def update_data(self):
         try:
-            self.thread.stop()
-            time.sleep(1)
-            self.thread = RealSenseThread(fps=fps_value)
-            self.thread.frame_ready.connect(self.process_frame)
-            self.thread.start()
+            frames = self.pipeline.wait_for_frames()
         except Exception as e:
-            print(f"[ERROR] Failed to restart RealSense: {e}")
-        self.fps_slider.setEnabled(True)
-
-    def select_roi(self):
-        if hasattr(self, 'latest_color'):
-            r = cv2.selectROI('Select ROI', self.latest_color, False, False)
-            cv2.destroyAllWindows()
-            if r[2] > 0 and r[3] > 0:
-                self.roi = r
-                self.ref_gray = None
-                self.ref_accum = None
-                self.ref_count = 0
-                self.ref_pts = None
-
-    def auto_seed_points(self, gray_img):
-        h, w = gray_img.shape
-        pts = []
-        for yy in range(FACET_SIZE, h - FACET_SIZE, STEP_SIZE):
-            for xx in range(FACET_SIZE, w - FACET_SIZE, STEP_SIZE):
-                pts.append([xx, yy])
-        return np.array(pts, np.float32).reshape(-1, 1, 2)
-
-    def process_frame(self, color_img, depth_img):
-        self.latest_color = color_img.copy()
-        if self.roi:
-            x, y, rw, rh = [int(v) for v in self.roi]
-            color_img = color_img[y:y+rh, x:x+rw]
-            depth_img = depth_img[y:y+rh, x:x+rw]
-        gray = color_img
-        overlay = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-
-        if self.ref_count < REF_ACCUM_FRAMES:
-            if self.ref_accum is None:
-                self.ref_accum = gray.astype(np.float32)
-            else:
-                self.ref_accum += gray.astype(np.float32)
-            self.ref_count += 1
-            if self.ref_count == REF_ACCUM_FRAMES:
-                self.ref_gray = (self.ref_accum / REF_ACCUM_FRAMES).astype(np.uint8)
-                self.ref_pts = self.auto_seed_points(self.ref_gray)
+            print(f'[ERROR] Frame grab failed: {e}')
             return
 
-        lk_params = dict(winSize=(15, 15), maxLevel=2, criteria=(cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 20, 0.03))
-        new_pts, st, err = cv2.calcOpticalFlowPyrLK(self.ref_gray, gray, self.ref_pts, None, **lk_params)
+        frames = self.align.process(frames)
+        depth_frame = frames.get_depth_frame()
+        color_frame = frames.get_color_frame()
+        if not depth_frame or not color_frame:
+            return
 
-        magnitudes = np.zeros(len(self.ref_pts))
-        for i, (old, new, status) in enumerate(zip(self.ref_pts.reshape(-1, 2), new_pts.reshape(-1, 2), st.reshape(-1))):
-            if status:
-                dx, dy = new[0] - old[0], new[1] - old[1]
-                if self.display_selector.currentText() == 'Displacement magnitude':
-                    magnitudes[i] = np.sqrt(dx ** 2 + dy ** 2)
-                else:
-                    magnitudes[i] = (abs(dx) + abs(dy)) / FACET_SIZE
-                cv2.arrowedLine(overlay, (int(old[0]), int(old[1])), (int(new[0]), int(new[1])), (255, 0, 0), 1, tipLength=0.3)
+        depth_image = np.asanyarray(depth_frame.get_data())
+        color_image = np.asanyarray(color_frame.get_data())
+        gray_image = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
 
-        heatmap = np.zeros(gray.shape, np.float32)
-        for pt, mag in zip(self.ref_pts.reshape(-1, 2), magnitudes):
-            x, y = int(pt[0]), int(pt[1])
-            if 0 <= y < heatmap.shape[0] and 0 <= x < heatmap.shape[1]:
-                heatmap[y, x] = mag
-        heatmap = cv2.GaussianBlur(heatmap, (0, 0), sigmaX=5, sigmaY=5)
-        heatmap = cv2.normalize(heatmap, None, 0, 255, cv2.NORM_MINMAX)
-        heatmap_color = cv2.applyColorMap(heatmap.astype(np.uint8), cv2.COLORMAP_JET)
-        overlay = cv2.addWeighted(heatmap_color, 0.5, overlay, 0.5, 0)
+        self.points = self.pc.calculate(depth_frame)
+        verts = np.asanyarray(self.points.get_vertices()).view(np.float32).reshape(-1, 3)
 
-        qimg = QtGui.QImage(overlay.data, overlay.shape[1], overlay.shape[0], overlay.shape[1] * 3, QtGui.QImage.Format_RGB888).rgbSwapped()
-        pixmap = QtGui.QPixmap.fromImage(qimg)
-        self.img_label.setPixmap(pixmap.scaled(self.img_label.size(), QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation))
+        seed_pts = self.auto_seed_points(gray_image.shape)
+        seed_3d = []
+        for x, y in seed_pts:
+            idx = int(y) * gray_image.shape[1] + int(x)
+            if idx < verts.shape[0]:
+                seed_3d.append(verts[idx])
+        seed_3d = np.array(seed_3d)
 
-    def closeEvent(self, e):
-        self.thread.stop()
-        e.accept()
+        self.seed_history.append(seed_3d)
+        if len(self.seed_history) > self.smoothing_window:
+            self.seed_history.pop(0)
+        smoothed_seeds = np.mean(np.array(self.seed_history), axis=0)
+
+        if self.prev_frame is not None:
+            flow = cv2.calcOpticalFlowFarneback(self.prev_frame, gray_image, None, 0.5, 3, 15, 3, 5, 1.2, 0)
+            dx = cv2.GaussianBlur(flow[..., 0], (3, 3), 0)
+            dy = cv2.GaussianBlur(flow[..., 1], (3, 3), 0)
+            exx = np.gradient(dx, axis=1)
+            eyy = np.gradient(dy, axis=0)
+            equiv_strain = np.sqrt(exx ** 2 + eyy ** 2)
+
+            if self.mode == 'Equivalent Strain':
+                selected_map = np.abs(equiv_strain)
+            elif self.mode == 'X-Strain':
+                selected_map = np.abs(exx)
+            elif self.mode == 'Y-Strain':
+                selected_map = np.abs(eyy)
+            elif self.mode == 'X-Displacement':
+                selected_map = np.abs(dx)
+            elif self.mode == 'Y-Displacement':
+                selected_map = np.abs(dy)
+            else:
+                selected_map = np.sqrt(dx**2 + dy**2)
+
+            selected_map = cv2.GaussianBlur(selected_map, (3, 3), 0)
+            selected_flat = cv2.resize(selected_map, (depth_image.shape[1], depth_image.shape[0])).flatten()
+            selected_norm = cv2.normalize(selected_flat, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+            colormap = cv2.applyColorMap(selected_norm, cv2.COLORMAP_JET)
+            colormap_rgb = colormap.reshape(-1, 3) / 255.0
+        else:
+            colormap_rgb = np.full((verts.shape[0], 3), [0.3, 0.3, 0.3])
+
+        mask = np.isfinite(verts).all(axis=1)
+        verts = verts[mask]
+        colormap_rgb = colormap_rgb[mask]
+
+        if verts.shape[0] > 80000:
+            idx = np.random.choice(verts.shape[0], 80000, replace=False)
+            verts = verts[idx]
+            colormap_rgb = colormap_rgb[idx]
+
+        self.scatter.setData(pos=verts, color=colormap_rgb, size=1)
+        if smoothed_seeds.size > 0:
+            self.seeds_visual.setData(pos=smoothed_seeds, size=6, color=(1,0.5,0,1))
+        self.prev_frame = gray_image.copy()
+
+    def closeEvent(self, event):
+        try:
+            self.pipeline.stop()
+        except Exception as e:
+            print(f'[WARNING] Failed to stop pipeline cleanly: {e}')
+        event.accept()
 
 if __name__ == '__main__':
     app = QtWidgets.QApplication(sys.argv)
-    window = DIC3DApp()
-    window.resize(1280, 800)
-    window.show()
+    viewer = RealSense3DDIC()
+    viewer.resize(1280, 800)
+    viewer.show()
     sys.exit(app.exec_())
