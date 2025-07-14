@@ -8,7 +8,7 @@ import pyqtgraph.opengl as gl
 
 
 class CameraWorker(QtCore.QThread):
-    data_ready = QtCore.pyqtSignal(object, object, object)  # verts, colors, seed points
+    data_ready = QtCore.pyqtSignal(object, object, object, dict)  # verts, colors, seeds, stats
 
     def __init__(self):
         super().__init__()
@@ -17,6 +17,8 @@ class CameraWorker(QtCore.QThread):
         self.seed_density = 20
         self.latest_frame = None
         self.mode = 'Total Displacement'
+        self.resolution = (640, 480)
+        self.fps = 30
 
     def run(self):
         try:
@@ -34,8 +36,8 @@ class CameraWorker(QtCore.QThread):
 
             pipeline = rs.pipeline()
             cfg = rs.config()
-            cfg.enable_stream(rs.stream.depth, 640, 480, rs.format.z16, 30)
-            cfg.enable_stream(rs.stream.color, 640, 480, rs.format.bgr8, 30)
+            cfg.enable_stream(rs.stream.depth, self.resolution[0], self.resolution[1], rs.format.z16, self.fps)
+            cfg.enable_stream(rs.stream.color, self.resolution[0], self.resolution[1], rs.format.bgr8, self.fps)
             pipeline.start(cfg)
             pc = rs.pointcloud()
             align = rs.align(rs.stream.color)
@@ -58,6 +60,8 @@ class CameraWorker(QtCore.QThread):
                 mask = np.isfinite(verts).all(axis=1)
                 verts_masked = verts[mask]
 
+                disp_stats = {'min': 0, 'max': 0, 'mean': 0}
+
                 if prev_gray is not None:
                     flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
                     dx = flow[..., 0]
@@ -79,6 +83,10 @@ class CameraWorker(QtCore.QThread):
                     else:
                         disp = np.sqrt(dx ** 2 + dy ** 2)
 
+                    disp_stats['min'] = float(np.min(disp))
+                    disp_stats['max'] = float(np.max(disp))
+                    disp_stats['mean'] = float(np.mean(disp))
+
                     disp_norm = cv2.normalize(disp, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
                     cmap = cv2.applyColorMap(disp_norm, cv2.COLORMAP_JET)
                     colors = cmap.reshape(-1, 3) / 255.0
@@ -86,10 +94,10 @@ class CameraWorker(QtCore.QThread):
                     colors = np.full((verts_masked.shape[0], 3), [0.3, 0.3, 0.3])
 
                 try:
-                    verts_img = np.zeros((480, 640, 3), dtype=np.float32)
+                    verts_img = np.zeros((self.resolution[1], self.resolution[0], 3), dtype=np.float32)
                     verts_img.reshape(-1, 3)[mask] = verts_masked
                 except:
-                    verts_img = np.zeros((480, 640, 3))
+                    verts_img = np.zeros((self.resolution[1], self.resolution[0], 3))
 
                 if self.roi:
                     x, y, w, h = self.roi
@@ -100,10 +108,10 @@ class CameraWorker(QtCore.QThread):
                     colors_crop = colors
 
                 seeds = []
-                step_y = max(1, 480 // self.seed_density)
-                step_x = max(1, 640 // self.seed_density)
-                for iy in range(0, 480, step_y):
-                    for ix in range(0, 640, step_x):
+                step_y = max(1, self.resolution[1] // self.seed_density)
+                step_x = max(1, self.resolution[0] // self.seed_density)
+                for iy in range(0, self.resolution[1], step_y):
+                    for ix in range(0, self.resolution[0], step_x):
                         if self.roi:
                             if not (x <= ix < x + w and y <= iy < y + h):
                                 continue
@@ -112,7 +120,7 @@ class CameraWorker(QtCore.QThread):
                             seeds.append(pt)
                 seeds = np.array(seeds)
 
-                self.data_ready.emit(verts_crop, colors_crop, seeds)
+                self.data_ready.emit(verts_crop, colors_crop, seeds, disp_stats)
                 prev_gray = gray.copy()
 
             pipeline.stop()
@@ -141,8 +149,8 @@ class DIC3DApp(QtWidgets.QWidget):
         self.gl_widget.setBackgroundColor('k')
         self.gl_widget.opts['distance'] = 2
         self.scatter = gl.GLScatterPlotItem(size=1)
-        self.seeds_scatter = gl.GLScatterPlotItem(size=5, color=(1, 1, 1, 1))    # seed points (white)
-        self.facets_scatter = gl.GLScatterPlotItem(size=10, color=(1, 1, 1, 1))  # facets (white, larger)
+        self.seeds_scatter = gl.GLScatterPlotItem(size=5, color=(1, 1, 1, 1))
+        self.facets_scatter = gl.GLScatterPlotItem(size=12, color=(1, 1, 1, 1))
         self.gl_widget.addItem(self.scatter)
         self.gl_widget.addItem(self.seeds_scatter)
         self.gl_widget.addItem(self.facets_scatter)
@@ -164,15 +172,9 @@ class DIC3DApp(QtWidgets.QWidget):
         self.gl_widget.addItem(y_line)
         self.gl_widget.addItem(z_line)
 
-        self.x_label = QtWidgets.QLabel('X', self)
-        self.x_label.setStyleSheet("color: red; font-size: 14px; background-color: rgba(0,0,0,0%)")
-        self.x_label.move(50, 50)
-        self.y_label = QtWidgets.QLabel('Y', self)
-        self.y_label.setStyleSheet("color: green; font-size: 14px; background-color: rgba(0,0,0,0%)")
-        self.y_label.move(80, 50)
-        self.z_label = QtWidgets.QLabel('Z', self)
-        self.z_label.setStyleSheet("color: blue; font-size: 14px; background-color: rgba(0,0,0,0%)")
-        self.z_label.move(110, 50)
+        self.stats_label = QtWidgets.QLabel(self)
+        self.stats_label.setStyleSheet("color: white; font-size: 14px;")
+        self.stats_label.move(20, 20)
 
         control_layout = QtWidgets.QHBoxLayout()
         self.mode_dropdown = QtWidgets.QComboBox()
@@ -194,22 +196,22 @@ class DIC3DApp(QtWidgets.QWidget):
         control_layout.addWidget(self.density_slider)
         self.density_slider.valueChanged.connect(self.update_seed_density)
 
-        # Checkboxes to toggle appearance
+        self.res_dropdown = QtWidgets.QComboBox()
+        self.res_dropdown.addItems(['640x480 @30fps', '848x480 @60fps', '1280x720 @30fps', '1920x1080 @15fps'])
+        control_layout.addWidget(QtWidgets.QLabel('Resolution'))
+        control_layout.addWidget(self.res_dropdown)
+        self.res_dropdown.currentTextChanged.connect(self.update_resolution)
+
         self.show_seeds_checkbox = QtWidgets.QCheckBox('Show Seed Points')
         self.show_seeds_checkbox.setChecked(True)
-        self.show_seeds_checkbox.stateChanged.connect(self.update_display)
-
         self.show_facets_checkbox = QtWidgets.QCheckBox('Show Facets')
         self.show_facets_checkbox.setChecked(True)
-        self.show_facets_checkbox.stateChanged.connect(self.update_display)
-
         control_layout.addWidget(self.show_seeds_checkbox)
         control_layout.addWidget(self.show_facets_checkbox)
 
         main_layout = QtWidgets.QVBoxLayout()
         main_layout.addLayout(control_layout)
         main_layout.addWidget(self.gl_widget, stretch=1)
-        main_layout.setContentsMargins(5, 5, 5, 5)
         self.setLayout(main_layout)
 
         self.worker = CameraWorker()
@@ -219,7 +221,7 @@ class DIC3DApp(QtWidgets.QWidget):
         self.mode_dropdown.currentTextChanged.connect(self.update_mode)
         self.update_mode(self.mode_dropdown.currentText())
 
-    def update_view(self, verts, colors, seeds):
+    def update_view(self, verts, colors, seeds, stats):
         self.scatter.setData(pos=verts, color=colors, size=1)
 
         if self.show_seeds_checkbox.isChecked() and seeds.size > 0:
@@ -228,9 +230,12 @@ class DIC3DApp(QtWidgets.QWidget):
             self.seeds_scatter.setData(pos=np.zeros((1, 3)), size=0)
 
         if self.show_facets_checkbox.isChecked() and seeds.size > 0:
-            self.facets_scatter.setData(pos=seeds, size=10)
+            self.facets_scatter.setData(pos=seeds, size=12)
         else:
             self.facets_scatter.setData(pos=np.zeros((1, 3)), size=0)
+
+        stats_text = f"Min: {stats['min']:.4f}, Max: {stats['max']:.4f}, Mean: {stats['mean']:.4f}"
+        self.stats_label.setText(stats_text)
 
     def select_roi(self):
         ret, frame = self.worker.get_last_frame()
@@ -247,15 +252,26 @@ class DIC3DApp(QtWidgets.QWidget):
 
     def update_seed_density(self, value):
         self.worker.seed_density = value
-        print(f'[INFO] Seed point density set to: {value}')
 
     def update_mode(self, mode):
         self.worker.mode = mode
-        print(f'[INFO] Mode set to: {mode}')
 
-    def update_display(self):
-        # Trigger a redraw
-        pass
+    def update_resolution(self, text):
+        res_map = {
+            '640x480 @30fps': (640, 480, 30),
+            '848x480 @60fps': (848, 480, 60),
+            '1280x720 @30fps': (1280, 720, 30),
+            '1920x1080 @15fps': (1920, 1080, 15),
+        }
+        res, h, fps = res_map[text]
+        self.worker.resolution = (res, h)
+        self.worker.fps = fps
+        self.worker.stop()
+        self.worker = CameraWorker()
+        self.worker.resolution = (res, h)
+        self.worker.fps = fps
+        self.worker.data_ready.connect(self.update_view)
+        self.worker.start()
 
     def closeEvent(self, event):
         self.worker.stop()
