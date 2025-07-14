@@ -79,7 +79,6 @@ class CameraWorker(QtCore.QThread):
                     else:
                         disp = np.sqrt(dx ** 2 + dy ** 2)
 
-                    # Normalize only masked displacement
                     disp_norm = cv2.normalize(disp, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
                     cmap = cv2.applyColorMap(disp_norm, cv2.COLORMAP_JET)
                     colors = cmap.reshape(-1, 3) / 255.0
@@ -89,16 +88,13 @@ class CameraWorker(QtCore.QThread):
                 try:
                     verts_img = np.zeros((480, 640, 3), dtype=np.float32)
                     verts_img.reshape(-1, 3)[mask] = verts_masked
-                    colors_img = np.zeros((480, 640, 3), dtype=np.float32)
-                    colors_img.reshape(-1, 3)[mask] = colors
                 except:
                     verts_img = np.zeros((480, 640, 3))
-                    colors_img = np.zeros((480, 640, 3))
 
                 if self.roi:
                     x, y, w, h = self.roi
                     verts_crop = verts_img[y:y + h, x:x + w, :].reshape(-1, 3)
-                    colors_crop = colors_img[y:y + h, x:x + w, :].reshape(-1, 3)
+                    colors_crop = colors.reshape(-1, 3)
                 else:
                     verts_crop = verts_masked
                     colors_crop = colors
@@ -145,9 +141,11 @@ class DIC3DApp(QtWidgets.QWidget):
         self.gl_widget.setBackgroundColor('k')
         self.gl_widget.opts['distance'] = 2
         self.scatter = gl.GLScatterPlotItem(size=1)
-        self.seeds_scatter = gl.GLScatterPlotItem(size=5, color=(1, 1, 1, 1))
+        self.seeds_scatter = gl.GLScatterPlotItem(size=5, color=(1, 1, 1, 1))    # seed points (white)
+        self.facets_scatter = gl.GLScatterPlotItem(size=10, color=(1, 1, 1, 1))  # facets (white, larger)
         self.gl_widget.addItem(self.scatter)
         self.gl_widget.addItem(self.seeds_scatter)
+        self.gl_widget.addItem(self.facets_scatter)
 
         grid = gl.GLGridItem()
         grid.setSize(0.5, 0.5)
@@ -196,6 +194,18 @@ class DIC3DApp(QtWidgets.QWidget):
         control_layout.addWidget(self.density_slider)
         self.density_slider.valueChanged.connect(self.update_seed_density)
 
+        # Checkboxes to toggle appearance
+        self.show_seeds_checkbox = QtWidgets.QCheckBox('Show Seed Points')
+        self.show_seeds_checkbox.setChecked(True)
+        self.show_seeds_checkbox.stateChanged.connect(self.update_display)
+
+        self.show_facets_checkbox = QtWidgets.QCheckBox('Show Facets')
+        self.show_facets_checkbox.setChecked(True)
+        self.show_facets_checkbox.stateChanged.connect(self.update_display)
+
+        control_layout.addWidget(self.show_seeds_checkbox)
+        control_layout.addWidget(self.show_facets_checkbox)
+
         main_layout = QtWidgets.QVBoxLayout()
         main_layout.addLayout(control_layout)
         main_layout.addWidget(self.gl_widget, stretch=1)
@@ -211,10 +221,16 @@ class DIC3DApp(QtWidgets.QWidget):
 
     def update_view(self, verts, colors, seeds):
         self.scatter.setData(pos=verts, color=colors, size=1)
-        if seeds.size > 0:
+
+        if self.show_seeds_checkbox.isChecked() and seeds.size > 0:
             self.seeds_scatter.setData(pos=seeds, size=5)
         else:
             self.seeds_scatter.setData(pos=np.zeros((1, 3)), size=0)
+
+        if self.show_facets_checkbox.isChecked() and seeds.size > 0:
+            self.facets_scatter.setData(pos=seeds, size=10)
+        else:
+            self.facets_scatter.setData(pos=np.zeros((1, 3)), size=0)
 
     def select_roi(self):
         ret, frame = self.worker.get_last_frame()
@@ -236,6 +252,10 @@ class DIC3DApp(QtWidgets.QWidget):
     def update_mode(self, mode):
         self.worker.mode = mode
         print(f'[INFO] Mode set to: {mode}')
+
+    def update_display(self):
+        # Trigger a redraw
+        pass
 
     def closeEvent(self, event):
         self.worker.stop()
