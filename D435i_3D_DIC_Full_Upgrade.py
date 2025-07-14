@@ -8,7 +8,7 @@ import pyqtgraph.opengl as gl
 
 
 class CameraWorker(QtCore.QThread):
-    data_ready = QtCore.pyqtSignal(object, object, object, dict)  # verts, colors, seeds, stats
+    data_ready = QtCore.pyqtSignal(object, object, object, object, dict)  # verts, colors, seeds, facet_mesh_data, stats
 
     def __init__(self):
         super().__init__()
@@ -108,8 +108,12 @@ class CameraWorker(QtCore.QThread):
                     colors_crop = colors
 
                 seeds = []
+                quad_verts = []
+                quad_faces = []
                 step_y = max(1, self.resolution[1] // self.seed_density)
                 step_x = max(1, self.resolution[0] // self.seed_density)
+                count = 0
+                patch_size = 0.002  # ~2mm patch
                 for iy in range(0, self.resolution[1], step_y):
                     for ix in range(0, self.resolution[0], step_x):
                         if self.roi:
@@ -118,9 +122,21 @@ class CameraWorker(QtCore.QThread):
                         pt = verts_img[iy, ix, :]
                         if np.isfinite(pt).all():
                             seeds.append(pt)
+                            # Create quad vertices around point
+                            v0 = pt + [-patch_size, -patch_size, 0]
+                            v1 = pt + [patch_size, -patch_size, 0]
+                            v2 = pt + [patch_size, patch_size, 0]
+                            v3 = pt + [-patch_size, patch_size, 0]
+                            base_idx = count * 4
+                            quad_verts.extend([v0, v1, v2, v3])
+                            quad_faces.extend([[base_idx, base_idx + 1, base_idx + 2],
+                                               [base_idx, base_idx + 2, base_idx + 3]])
+                            count += 1
                 seeds = np.array(seeds)
+                quad_verts = np.array(quad_verts)
+                quad_faces = np.array(quad_faces)
 
-                self.data_ready.emit(verts_crop, colors_crop, seeds, disp_stats)
+                self.data_ready.emit(verts_crop, colors_crop, seeds, (quad_verts, quad_faces), disp_stats)
                 prev_gray = gray.copy()
 
             pipeline.stop()
@@ -150,10 +166,15 @@ class DIC3DApp(QtWidgets.QWidget):
         self.gl_widget.opts['distance'] = 2
         self.scatter = gl.GLScatterPlotItem(size=1)
         self.seeds_scatter = gl.GLScatterPlotItem(size=5, color=(1, 1, 1, 1))
-        self.facets_scatter = gl.GLScatterPlotItem(size=12, color=(1, 1, 1, 1))
+        self.facets_mesh = gl.GLMeshItem(vertexes=np.array([[0, 0, 0]]),
+                                         faces=np.array([[0, 0, 0]]),
+                                         color=(1, 1, 1, 1),
+                                         smooth=False,
+                                         drawEdges=False,
+                                         drawFaces=True)
         self.gl_widget.addItem(self.scatter)
         self.gl_widget.addItem(self.seeds_scatter)
-        self.gl_widget.addItem(self.facets_scatter)
+        self.gl_widget.addItem(self.facets_mesh)
 
         grid = gl.GLGridItem()
         grid.setSize(0.5, 0.5)
@@ -161,19 +182,8 @@ class DIC3DApp(QtWidgets.QWidget):
         grid.setDepthValue(-10)
         self.gl_widget.addItem(grid)
 
-        axis_length = 0.1
-        x_line = gl.GLLinePlotItem(pos=np.array([[0, 0, 0], [axis_length, 0, 0]]),
-                                   color=pg.glColor('r'), width=3, antialias=True)
-        y_line = gl.GLLinePlotItem(pos=np.array([[0, 0, 0], [0, axis_length, 0]]),
-                                   color=pg.glColor('g'), width=3, antialias=True)
-        z_line = gl.GLLinePlotItem(pos=np.array([[0, 0, 0], [0, 0, axis_length]]),
-                                   color=pg.glColor('b'), width=3, antialias=True)
-        self.gl_widget.addItem(x_line)
-        self.gl_widget.addItem(y_line)
-        self.gl_widget.addItem(z_line)
-
         self.stats_label = QtWidgets.QLabel(self)
-        self.stats_label.setStyleSheet("color: white; font-size: 14px;")
+        self.stats_label.setStyleSheet("color: white; font-size: 14px; background-color: rgba(0,0,0,0%)")
         self.stats_label.move(20, 20)
 
         control_layout = QtWidgets.QHBoxLayout()
@@ -221,7 +231,7 @@ class DIC3DApp(QtWidgets.QWidget):
         self.mode_dropdown.currentTextChanged.connect(self.update_mode)
         self.update_mode(self.mode_dropdown.currentText())
 
-    def update_view(self, verts, colors, seeds, stats):
+    def update_view(self, verts, colors, seeds, facet_mesh_data, stats):
         self.scatter.setData(pos=verts, color=colors, size=1)
 
         if self.show_seeds_checkbox.isChecked() and seeds.size > 0:
@@ -229,10 +239,11 @@ class DIC3DApp(QtWidgets.QWidget):
         else:
             self.seeds_scatter.setData(pos=np.zeros((1, 3)), size=0)
 
-        if self.show_facets_checkbox.isChecked() and seeds.size > 0:
-            self.facets_scatter.setData(pos=seeds, size=12)
+        if self.show_facets_checkbox.isChecked() and facet_mesh_data[0].shape[0] > 0:
+            verts_mesh, faces_mesh = facet_mesh_data
+            self.facets_mesh.setMeshData(vertexes=verts_mesh, faces=faces_mesh, color=(1, 1, 1, 1))
         else:
-            self.facets_scatter.setData(pos=np.zeros((1, 3)), size=0)
+            self.facets_mesh.setMeshData(vertexes=np.array([[0, 0, 0]]), faces=np.array([[0, 0, 0]]))
 
         stats_text = f"Min: {stats['min']:.4f}, Max: {stats['max']:.4f}, Mean: {stats['mean']:.4f}"
         self.stats_label.setText(stats_text)
@@ -246,7 +257,6 @@ class DIC3DApp(QtWidgets.QWidget):
         cv2.destroyWindow("Select ROI")
         if roi != (0, 0, 0, 0):
             self.worker.roi = roi
-            print(f'[INFO] ROI set to: {roi}')
         else:
             self.worker.roi = None
 
