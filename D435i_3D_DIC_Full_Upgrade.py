@@ -15,6 +15,7 @@ class CameraWorker(QtCore.QThread):
         self.running = True
         self.roi = None
         self.seed_density = 20
+        self.latest_frame = None
 
     def run(self):
         try:
@@ -48,6 +49,7 @@ class CameraWorker(QtCore.QThread):
                     continue
 
                 color_image = np.asanyarray(color_frame.get_data())
+                self.latest_frame = color_image.copy()
                 gray = cv2.cvtColor(color_image, cv2.COLOR_BGR2GRAY)
                 pc.map_to(color_frame)
                 points = pc.calculate(depth_frame)
@@ -60,7 +62,24 @@ class CameraWorker(QtCore.QThread):
                     dx = flow[..., 0]
                     dy = flow[..., 1]
                     dz = verts[:, 2] if verts.shape[0] > 0 else np.zeros_like(dx)
-                    disp = np.sqrt(dx ** 2 + dy ** 2)
+
+                    mode = 'Total Displacement'  # default fallback
+                    if hasattr(self, 'mode'):
+                        mode = self.mode
+
+                    if mode == 'X-Displacement':
+                        disp = np.abs(dx)
+                    elif mode == 'Y-Displacement':
+                        disp = np.abs(dy)
+                    elif mode == 'Z-Displacement':
+                        disp = np.abs(dz)
+                    elif mode == 'Equivalent Strain':
+                        disp = np.sqrt(dx ** 2 + dy ** 2)
+                    elif mode == 'Total Displacement':
+                        disp = np.sqrt(dx ** 2 + dy ** 2 + dz ** 2)
+                    else:
+                        disp = np.sqrt(dx ** 2 + dy ** 2)
+
                     disp_resized = cv2.resize(disp, (gray.shape[1], gray.shape[0])).flatten()
                     disp_norm = cv2.normalize(disp_resized, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
                     cmap = cv2.applyColorMap(disp_norm, cv2.COLORMAP_JET)
@@ -69,7 +88,6 @@ class CameraWorker(QtCore.QThread):
                 else:
                     colors = np.full((verts.shape[0], 3), [0.3, 0.3, 0.3])
 
-                # Reshape to image grid
                 try:
                     verts_img = verts.reshape((480, 640, 3))
                     colors_img = colors.reshape((480, 640, 3))
@@ -77,7 +95,6 @@ class CameraWorker(QtCore.QThread):
                     verts_img = np.zeros((480, 640, 3))
                     colors_img = np.zeros((480, 640, 3))
 
-                # Apply ROI crop if set
                 if self.roi:
                     x, y, w, h = self.roi
                     verts_crop = verts_img[y:y + h, x:x + w, :].reshape(-1, 3)
@@ -86,10 +103,9 @@ class CameraWorker(QtCore.QThread):
                     verts_crop = verts
                     colors_crop = colors
 
-                # Seed points generation
                 seeds = []
-                step_y = 480 // self.seed_density
-                step_x = 640 // self.seed_density
+                step_y = max(1, 480 // self.seed_density)
+                step_x = max(1, 640 // self.seed_density)
                 for iy in range(0, 480, step_y):
                     for ix in range(0, 640, step_x):
                         if self.roi:
@@ -113,14 +129,9 @@ class CameraWorker(QtCore.QThread):
         self.wait()
 
     def get_last_frame(self):
-        try:
-            frames = self.pipeline.wait_for_frames()
-            color_frame = frames.get_color_frame()
-            if not color_frame:
-                return False, None
-            color_image = np.asanyarray(color_frame.get_data())
-            return True, color_image
-        except:
+        if self.latest_frame is not None:
+            return True, self.latest_frame.copy()
+        else:
             return False, None
 
 
@@ -130,23 +141,20 @@ class DIC3DApp(QtWidgets.QWidget):
         self.setWindowTitle('Intel D435i 3D DIC System')
         self.setGeometry(100, 100, 1600, 900)
 
-        # 3D view
         self.gl_widget = gl.GLViewWidget()
         self.gl_widget.setBackgroundColor('k')
         self.gl_widget.opts['distance'] = 2
         self.scatter = gl.GLScatterPlotItem(size=1)
-        self.seeds_scatter = gl.GLScatterPlotItem(size=5, color=(1, 1, 1, 1))  # white seeds
+        self.seeds_scatter = gl.GLScatterPlotItem(size=5, color=(1, 1, 1, 1))
         self.gl_widget.addItem(self.scatter)
         self.gl_widget.addItem(self.seeds_scatter)
 
-        # Grid at origin
         grid = gl.GLGridItem()
         grid.setSize(0.5, 0.5)
         grid.setSpacing(0.05, 0.05)
         grid.setDepthValue(-10)
         self.gl_widget.addItem(grid)
 
-        # X, Y, Z axes
         axis_length = 0.1
         x_line = gl.GLLinePlotItem(pos=np.array([[0, 0, 0], [axis_length, 0, 0]]),
                                    color=pg.glColor('r'), width=3, antialias=True)
@@ -158,7 +166,6 @@ class DIC3DApp(QtWidgets.QWidget):
         self.gl_widget.addItem(y_line)
         self.gl_widget.addItem(z_line)
 
-        # Labels overlay
         self.x_label = QtWidgets.QLabel('X', self)
         self.x_label.setStyleSheet("color: red; font-size: 14px; background-color: rgba(0,0,0,0%)")
         self.x_label.move(50, 50)
@@ -169,10 +176,9 @@ class DIC3DApp(QtWidgets.QWidget):
         self.z_label.setStyleSheet("color: blue; font-size: 14px; background-color: rgba(0,0,0,0%)")
         self.z_label.move(110, 50)
 
-        # Controls
         control_layout = QtWidgets.QHBoxLayout()
         self.mode_dropdown = QtWidgets.QComboBox()
-        self.mode_dropdown.addItems(['Equivalent Strain', 'X-Displacement', 'Y-Displacement', 'Z-Displacement'])
+        self.mode_dropdown.addItems(['Equivalent Strain', 'X-Displacement', 'Y-Displacement', 'Z-Displacement', 'Total Displacement'])
         control_layout.addWidget(QtWidgets.QLabel('Mode:'))
         control_layout.addWidget(self.mode_dropdown)
 
@@ -190,17 +196,19 @@ class DIC3DApp(QtWidgets.QWidget):
         control_layout.addWidget(self.density_slider)
         self.density_slider.valueChanged.connect(self.update_seed_density)
 
-        # Main layout
         main_layout = QtWidgets.QVBoxLayout()
         main_layout.addLayout(control_layout)
         main_layout.addWidget(self.gl_widget, stretch=1)
         main_layout.setContentsMargins(5, 5, 5, 5)
         self.setLayout(main_layout)
 
-        # Worker thread
         self.worker = CameraWorker()
         self.worker.data_ready.connect(self.update_view)
         self.worker.start()
+
+        # Sync dropdown mode to worker
+        self.mode_dropdown.currentTextChanged.connect(self.update_mode)
+        self.update_mode(self.mode_dropdown.currentText())
 
     def update_view(self, verts, colors, seeds):
         self.scatter.setData(pos=verts, color=colors, size=1)
@@ -225,6 +233,10 @@ class DIC3DApp(QtWidgets.QWidget):
     def update_seed_density(self, value):
         self.worker.seed_density = value
         print(f'[INFO] Seed point density set to: {value}')
+
+    def update_mode(self, mode):
+        self.worker.mode = mode
+        print(f'[INFO] Mode set to: {mode}')
 
     def closeEvent(self, event):
         self.worker.stop()
