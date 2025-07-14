@@ -1,4 +1,4 @@
-# UPGRADE: Add Z-Displacement display and RGB live footage overlay
+# UPGRADE: Add Z-Displacement display, RGB overlay, and seed point density control
 import sys
 import numpy as np
 import pyrealsense2 as rs
@@ -24,6 +24,15 @@ class RealSense3DDIC(QtWidgets.QWidget):
         self.dropdown.addItems(['Equivalent Strain', 'X-Strain', 'Y-Strain', 'Z-Displacement', 'X-Displacement', 'Y-Displacement', 'RGB Live Overlay'])
         self.dropdown.currentIndexChanged.connect(self.change_mode)
         layout.addWidget(self.dropdown)
+
+        self.seed_slider = QtWidgets.QSlider(QtCore.Qt.Horizontal)
+        self.seed_slider.setMinimum(5)
+        self.seed_slider.setMaximum(100)
+        self.seed_slider.setValue(30)
+        self.seed_slider.valueChanged.connect(self.change_seed_density)
+        layout.addWidget(QtWidgets.QLabel('Seed Point Density'))
+        layout.addWidget(self.seed_slider)
+
         layout.addWidget(self.gl_widget, stretch=1)
         self.setLayout(layout)
 
@@ -72,6 +81,9 @@ class RealSense3DDIC(QtWidgets.QWidget):
 
     def change_mode(self, index):
         self.mode = self.dropdown.currentText()
+
+    def change_seed_density(self, value):
+        self.seed_step = value
 
     def auto_seed_points(self, shape):
         h, w = shape
