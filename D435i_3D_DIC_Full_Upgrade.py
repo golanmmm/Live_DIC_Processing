@@ -16,6 +16,7 @@ class CameraWorker(QtCore.QThread):
         self.roi = None
         self.seed_density = 20
         self.latest_frame = None
+        self.mode = 'Total Displacement'
 
     def run(self):
         try:
@@ -55,42 +56,41 @@ class CameraWorker(QtCore.QThread):
                 points = pc.calculate(depth_frame)
                 verts = np.asanyarray(points.get_vertices()).view(np.float32).reshape(-1, 3)
                 mask = np.isfinite(verts).all(axis=1)
-                verts = verts[mask]
+                verts_masked = verts[mask]
 
                 if prev_gray is not None:
                     flow = cv2.calcOpticalFlowFarneback(prev_gray, gray, None, 0.5, 3, 15, 3, 5, 1.2, 0)
                     dx = flow[..., 0]
                     dy = flow[..., 1]
-                    dz = verts[:, 2] if verts.shape[0] > 0 else np.zeros_like(dx)
+                    dz_full = verts[:, 2]
+                    dz = dz_full[mask] if verts_masked.shape[0] > 0 else np.zeros_like(dx.flatten())
 
-                    mode = 'Total Displacement'  # default fallback
-                    if hasattr(self, 'mode'):
-                        mode = self.mode
-
-                    if mode == 'X-Displacement':
+                    if self.mode == 'X-Displacement':
                         disp = np.abs(dx)
-                    elif mode == 'Y-Displacement':
+                    elif self.mode == 'Y-Displacement':
                         disp = np.abs(dy)
-                    elif mode == 'Z-Displacement':
-                        disp = np.abs(dz)
-                    elif mode == 'Equivalent Strain':
+                    elif self.mode == 'Z-Displacement':
+                        disp = np.abs(dz).reshape(-1)
+                    elif self.mode == 'Equivalent Strain':
                         disp = np.sqrt(dx ** 2 + dy ** 2)
-                    elif mode == 'Total Displacement':
-                        disp = np.sqrt(dx ** 2 + dy ** 2 + dz ** 2)
+                    elif self.mode == 'Total Displacement':
+                        disp_xy = np.sqrt(dx ** 2 + dy ** 2)
+                        disp = np.sqrt(disp_xy.flatten()[mask] ** 2 + dz.flatten() ** 2)
                     else:
                         disp = np.sqrt(dx ** 2 + dy ** 2)
 
-                    disp_resized = cv2.resize(disp, (gray.shape[1], gray.shape[0])).flatten()
-                    disp_norm = cv2.normalize(disp_resized, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                    # Normalize only masked displacement
+                    disp_norm = cv2.normalize(disp, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
                     cmap = cv2.applyColorMap(disp_norm, cv2.COLORMAP_JET)
                     colors = cmap.reshape(-1, 3) / 255.0
-                    colors = colors[mask]
                 else:
-                    colors = np.full((verts.shape[0], 3), [0.3, 0.3, 0.3])
+                    colors = np.full((verts_masked.shape[0], 3), [0.3, 0.3, 0.3])
 
                 try:
-                    verts_img = verts.reshape((480, 640, 3))
-                    colors_img = colors.reshape((480, 640, 3))
+                    verts_img = np.zeros((480, 640, 3), dtype=np.float32)
+                    verts_img.reshape(-1, 3)[mask] = verts_masked
+                    colors_img = np.zeros((480, 640, 3), dtype=np.float32)
+                    colors_img.reshape(-1, 3)[mask] = colors
                 except:
                     verts_img = np.zeros((480, 640, 3))
                     colors_img = np.zeros((480, 640, 3))
@@ -100,7 +100,7 @@ class CameraWorker(QtCore.QThread):
                     verts_crop = verts_img[y:y + h, x:x + w, :].reshape(-1, 3)
                     colors_crop = colors_img[y:y + h, x:x + w, :].reshape(-1, 3)
                 else:
-                    verts_crop = verts
+                    verts_crop = verts_masked
                     colors_crop = colors
 
                 seeds = []
@@ -206,7 +206,6 @@ class DIC3DApp(QtWidgets.QWidget):
         self.worker.data_ready.connect(self.update_view)
         self.worker.start()
 
-        # Sync dropdown mode to worker
         self.mode_dropdown.currentTextChanged.connect(self.update_mode)
         self.update_mode(self.mode_dropdown.currentText())
 
