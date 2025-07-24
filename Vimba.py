@@ -1,84 +1,75 @@
-import cv2, time, threading, queue
-from vmbpy import (VmbSystem, PixelFormat, Camera, Stream, Frame,
-                   FeaturePersistOptions)
+import cv2
+import numpy as np
+from vmbpy import VmbSystem, FrameStatus, PixelFormat
+from threading import Thread
+from queue import Queue
 
-# --------------------------- display thread ---------------------------------
-def display_worker(img_q: "queue.Queue[None | tuple]"):
-    fps_frames, fps_t0 = 0, time.time()
-    while True:
-        item = img_q.get()
-        if item is None:                      # sentinel -> quit
-            break
-        img = item
-        cv2.imshow("Manta G‑125B  live", img)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
-        # fps counter
-        fps_frames += 1
-        now = time.time()
-        if now - fps_t0 >= 1:
-            print(f"FPS: {fps_frames}")
-            fps_frames, fps_t0 = 0, now
+frame_queue = Queue(maxsize=2)
+running = True
+
+def to_bgr(frame):
+    try:
+        img = frame.as_numpy_ndarray()
+        if img.ndim == 2:
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        return img
+    except AttributeError:
+        fmt = frame.get_pixel_format()
+        w, h = frame.get_width(), frame.get_height()
+        buf = frame.get_buffer()
+        if fmt == PixelFormat.Mono8:
+            img = np.frombuffer(buf, dtype=np.uint8).reshape(h, w)
+            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        elif fmt == PixelFormat.Bgr8:
+            return np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
+        raise RuntimeError(f"Unsupported format: {fmt}")
+
+def handle_frame(cam, stream, frame):
+    if frame.get_status() == FrameStatus.Complete:
+        img = to_bgr(frame)
+        if not frame_queue.full():
+            frame_queue.put(img)
+    stream.queue_frame(frame)
+
+def display_thread():
+    global running
+    while running:
+        if not frame_queue.empty():
+            frame = frame_queue.get()
+            cv2.imshow("Live Stream", frame)
+            if cv2.waitKey(1) & 0xFF == 27:
+                running = False
+                break
     cv2.destroyAllWindows()
 
-# --------------------------- frame handler ----------------------------------
-def frame_handler(cam: Camera, stream: Stream, frame: Frame, img_q):
-    # *** ONLY light‑weight work here ***
-    if frame.get_pixel_format() != PixelFormat.Mono8:
-        frame.convert_pixel_format(PixelFormat.Bgr8)
-        img = frame.as_opencv_image()         # 3‑channel
-    else:
-        gray = frame.as_numpy_ndarray()
-        img = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
-    img_q.put(img)                            # hand frame to GUI thread
-    stream.queue_frame(frame)                 # re‑queue for reuse
-
-# --------------------------- main -------------------------------------------
-def run_fast_live_view(buffer_count: int = 20):
-    img_q: "queue.Queue[None | tuple]" = queue.Queue(maxsize=buffer_count * 2)
-    disp_th = threading.Thread(target=display_worker, args=(img_q,), daemon=True)
-
+def main():
+    global running
     with VmbSystem.get_instance() as vmb:
-        cam: Camera = vmb.get_all_cameras()[0]
-        print("✅ Opening:", cam.get_name())
+        cams = vmb.get_all_cameras()
+        if not cams:
+            raise RuntimeError("No cameras found")
 
-        with cam:
-            # ---------- one‑time performance tweaks ----------
-            # 1) Packet‑size auto tune (retry safe)
-            try:
-                cam.run_command("GVSPAdjustPacketSize")
-                cam.get_feature_by_name("GVSPAdjustPacketSize").wait_to_complete(1000)
-            except Exception:
-                pass                              # ignore older firmware
+        with cams[0] as cam:
+            if PixelFormat.Bgr8 in cam.get_pixel_formats():
+                cam.set_pixel_format(PixelFormat.Bgr8)
+            elif PixelFormat.Mono8 in cam.get_pixel_formats():
+                cam.set_pixel_format(PixelFormat.Mono8)
 
-            # 2) Max link throughput (≈ GigE wire speed)
-            try:
-                cam.get_feature_by_name("DeviceLinkThroughputLimit").set(115_000_000)
-            except Exception:
+            # Optional performance tuning
+            # cam.GVSPPacketSize.set(8228)
+            # cam.ExposureTime.set(5000)
+
+            cam.start_streaming(handle_frame, buffer_count=8)
+            print("🚀 Streaming... Press ESC in window to stop")
+
+            thread = Thread(target=display_thread)
+            thread.start()
+
+            while cam.is_streaming() and running:
                 pass
 
-            # 3) Pixel format & ROI
-            cam.set_pixel_format(PixelFormat.Mono8)      # fastest
-            # Example ROI: uncomment next two lines for 640×480 @ ~60 fps
-            # cam.get_feature_by_name("Width").set(640)
-            # cam.get_feature_by_name("Height").set(480)
-
-            # 4) Exposure
-            cam.get_feature_by_name("ExposureTime").set(10_000)   # 10 ms
-
-            # ---------- start threads ----------
-            disp_th.start()
-            cam.start_streaming(lambda c, s, f: frame_handler(c, s, f, img_q),
-                                buffer_count=buffer_count)
-            print("🔴 press  q  in the window to stop")
-
-            # keep main thread alive until display closes
-            disp_th.join()
-
             cam.stop_streaming()
-
-    img_q.put(None)                           # tell display thread to quit
-    print("✅ Done")
+            thread.join()
 
 if __name__ == "__main__":
-    run_fast_live_view()
+    main()
