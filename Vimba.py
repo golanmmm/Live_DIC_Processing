@@ -1,75 +1,88 @@
 import cv2
 import numpy as np
+import time
 from vmbpy import VmbSystem, FrameStatus, PixelFormat
-from threading import Thread
-from queue import Queue
+from threading import Lock
 
-frame_queue = Queue(maxsize=2)
+# === Globals ===
+latest_frame = None
+frame_lock = Lock()
 running = True
 
-def to_bgr(frame):
-    try:
-        img = frame.as_numpy_ndarray()
-        if img.ndim == 2:
-            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        return img
-    except AttributeError:
-        fmt = frame.get_pixel_format()
-        w, h = frame.get_width(), frame.get_height()
-        buf = frame.get_buffer()
-        if fmt == PixelFormat.Mono8:
-            img = np.frombuffer(buf, dtype=np.uint8).reshape(h, w)
-            return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        elif fmt == PixelFormat.Bgr8:
-            return np.frombuffer(buf, dtype=np.uint8).reshape(h, w, 3)
-        raise RuntimeError(f"Unsupported format: {fmt}")
 
+# === Convert frame to OpenCV grayscale image ===
+def to_gray(frame):
+    img = frame.as_numpy_ndarray()
+    return img  # Mono8 = already 2D array
+
+
+# === Vimba frame handler (runs in camera thread) ===
 def handle_frame(cam, stream, frame):
+    global latest_frame
     if frame.get_status() == FrameStatus.Complete:
-        img = to_bgr(frame)
-        if not frame_queue.full():
-            frame_queue.put(img)
+        img = to_gray(frame)
+        with frame_lock:
+            latest_frame = img
     stream.queue_frame(frame)
 
-def display_thread():
-    global running
-    while running:
-        if not frame_queue.empty():
-            frame = frame_queue.get()
-            cv2.imshow("Live Stream", frame)
-            if cv2.waitKey(1) & 0xFF == 27:
-                running = False
-                break
-    cv2.destroyAllWindows()
 
+# === Main function ===
 def main():
     global running
     with VmbSystem.get_instance() as vmb:
         cams = vmb.get_all_cameras()
         if not cams:
-            raise RuntimeError("No cameras found")
+            raise RuntimeError("No Allied Vision cameras found.")
 
         with cams[0] as cam:
-            if PixelFormat.Bgr8 in cam.get_pixel_formats():
-                cam.set_pixel_format(PixelFormat.Bgr8)
-            elif PixelFormat.Mono8 in cam.get_pixel_formats():
+            if PixelFormat.Mono8 in cam.get_pixel_formats():
                 cam.set_pixel_format(PixelFormat.Mono8)
+            else:
+                raise RuntimeError("Camera does not support Mono8 format.")
 
-            # Optional performance tuning
-            # cam.GVSPPacketSize.set(8228)
-            # cam.ExposureTime.set(5000)
+            # Set GVSPPacketSize
+            try:
+                feature = cam.get_feature_by_name("GVSPPacketSize")
+                feature.set(8228)
+                print("✅ GVSPPacketSize set to 8228")
+            except Exception as e:
+                print(f"⚠️ Failed to set GVSPPacketSize: {e}")
 
-            cam.start_streaming(handle_frame, buffer_count=8)
-            print("🚀 Streaming... Press ESC in window to stop")
+            # --- Optional tuning ---
+            # cam.ExposureTime.set(3000)  # in µs
+            # cam.AcquisitionFrameRate.set(60)
 
-            thread = Thread(target=display_thread)
-            thread.start()
+            # --- Start streaming ---
+            cam.start_streaming(handle_frame, buffer_count=10)
+            print("🎥 Streaming started. Press ESC to quit.")
+
+            # --- Display loop in main thread ---
+            prev_time = time.time()
+            frame_count = 0
 
             while cam.is_streaming() and running:
-                pass
+                with frame_lock:
+                    frame = latest_frame.copy() if latest_frame is not None else None
+
+                if frame is not None:
+                    cv2.imshow("Low-Latency Live Stream", frame)
+                    frame_count += 1
+
+                # Exit on ESC
+                if cv2.waitKey(1) & 0xFF == 27:
+                    running = False
+                    cam.stop_streaming()
+                    break
+
+                # Print FPS every second
+                if time.time() - prev_time >= 1.0:
+                    print(f"FPS: {frame_count}")
+                    frame_count = 0
+                    prev_time = time.time()
 
             cam.stop_streaming()
-            thread.join()
+            cv2.destroyAllWindows()
+
 
 if __name__ == "__main__":
     main()
