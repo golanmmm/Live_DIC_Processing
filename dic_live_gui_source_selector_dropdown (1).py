@@ -30,7 +30,7 @@ class Grabber(QtCore.QThread):
         self.keep_running = True
     def run(self):
         while self.keep_running:
-            cap = cv2.VideoCapture(0)
+            cap = cv2.VideoCapture(2)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
             if not cap.isOpened():
                 time.sleep(1); continue
