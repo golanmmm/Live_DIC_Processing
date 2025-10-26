@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # ------------------------------------------------------------------
-# Live-DIC GUI  –  with dual‐format recording
+# Live-DIC GUI  –  with dual‐format recording + gauge CSV export
 # ------------------------------------------------------------------
-import sys, os, time, traceback
+import sys, os, time, traceback, csv  # <-- CSV added
 import cv2
 import numpy as np
 from PyQt5 import QtCore, QtGui, QtWidgets
@@ -47,6 +47,46 @@ class Grabber(QtCore.QThread):
         self.wait()
 
 # ------------------------- main GUI
+class CSVWriterThread(QtCore.QThread):
+    def __init__(self, filepath, header, q):
+        super().__init__()
+        self.filepath = filepath
+        self.header = header
+        self.q = q
+        self._running = True
+        self._last_flush = time.time()
+    def run(self):
+        try:
+            # open once, buffered
+            with open(self.filepath, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=self.header)
+                writer.writeheader()
+                while self._running:
+                    try:
+                        row = self.q.get(timeout=0.2)
+                    except Exception:
+                        row = None
+                    if row is None:
+                        # periodic flush
+                        if time.time()-self._last_flush > 0.5:
+                            try:
+                                f.flush()
+                            except Exception:
+                                pass
+                            self._last_flush = time.time()
+                        continue
+                    writer.writerow(row)
+                    try:
+                        f.flush()
+                    except Exception:
+                        pass
+                    self._last_flush = time.time()
+        except Exception as e:
+            pass
+    def stop(self):
+        self._running = False
+        self.wait()
+
 class DICLive(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
@@ -69,6 +109,17 @@ class DICLive(QtWidgets.QMainWindow):
         # gauge
         self.gauge_pts = None
         self.gauge_L0_mm = None
+
+        # --- NEW: export tracking for gauge line averages
+        self.export_rows = []  # in-memory cache (optional)
+        self._export_start_time = None
+        # --- NEW: live-logging infra
+        import queue
+        self.log_queue = queue.Queue(maxsize=10000)
+        self.logger_thread = None
+        self.live_logging = False
+        self.log_every_n = 1  # frames
+        self._last_logged_frame = 0
 
         # recording & FPS
         self.recording = False
@@ -96,6 +147,11 @@ class DICLive(QtWidgets.QMainWindow):
         self.btn_cal    = QtWidgets.QPushButton("Calibrate")
         self.btn_gauge  = QtWidgets.QPushButton("Select Gauge Points")
         self.btn_rec    = QtWidgets.QPushButton("Start Recording")
+        # --- NEW: export button (writes CSV readable by Excel)
+        self.btn_export = QtWidgets.QPushButton("Export Gauge Averages (CSV)")
+        # --- NEW: live logging controls
+        self.btn_log_toggle = QtWidgets.QPushButton("Start Live Logging")
+        self.spin_logN = QtWidgets.QSpinBox(); self.spin_logN.setRange(1, 1000); self.spin_logN.setValue(1)
 
         # Format selector
         self.combo_rec_format = QtWidgets.QComboBox()
@@ -116,11 +172,11 @@ class DICLive(QtWidgets.QMainWindow):
         self.spin_vmin   = QtWidgets.QDoubleSpinBox(); self.spin_vmin.setDecimals(6)
         self.spin_vmax   = QtWidgets.QDoubleSpinBox(); self.spin_vmax.setDecimals(6)
         self.spin_alpha  = QtWidgets.QDoubleSpinBox(); self.spin_alpha.setRange(0,1); self.spin_alpha.setSingleStep(0.05); self.spin_alpha.setValue(0.5)
-        self.spin_ks     = QtWidgets.QSpinBox(); self.spin_ks.setRange(1,101); self.spin_ks.setSingleStep(2); self.spin_ks.setValue(51)
-        self.spin_cmblur = QtWidgets.QSpinBox(); self.spin_cmblur.setRange(1,101); self.spin_cmblur.setSingleStep(2); self.spin_cmblur.setValue(51)
+        self.spin_ks     = QtWidgets.QSpinBox(); self.spin_ks.setRange(1,101); self.spin_ks.setSingleStep(2); self.spin_ks.setValue(100)
+        self.spin_cmblur = QtWidgets.QSpinBox(); self.spin_cmblur.setRange(1,101); self.spin_cmblur.setSingleStep(2); self.spin_cmblur.setValue(1)
         self.chk_facets  = QtWidgets.QCheckBox("Show Facets"); self.chk_facets.setChecked(True)
-        self.chk_diff    = QtWidgets.QCheckBox("Differential ref")
-        self.spin_int    = QtWidgets.QSpinBox(); self.spin_int.setRange(1,500); self.spin_int.setValue(30)
+        self.chk_diff    = QtWidgets.QCheckBox("Differential ref"); self.chk_diff.setChecked(True)
+        self.spin_int    = QtWidgets.QSpinBox(); self.spin_int.setRange(1,500); self.spin_int.setValue(1)
 
         # Layout
         form = QtWidgets.QFormLayout()
@@ -140,6 +196,10 @@ class DICLive(QtWidgets.QMainWindow):
             (self.btn_gauge,),
             (self.btn_rec,),
             ("Rec Format:", self.combo_rec_format),
+            # --- NEW: export + live logging controls
+            (self.btn_export,),
+            (self.btn_log_toggle,),
+            ("Log every N frames:", self.spin_logN),
             ("FPS:",       self.lbl_fps),
             ("Metric:",    self.combo_met),
             (self.chk_auto,),
@@ -179,6 +239,11 @@ class DICLive(QtWidgets.QMainWindow):
         self.btn_gauge. clicked.connect(self.select_gauge)
         self.btn_rec.   clicked.connect(self.toggle_record)
         self.combo_mode.currentTextChanged.connect(self.apply_mode)
+        # --- NEW: export handler
+        self.btn_export.clicked.connect(self.export_csv)
+        # --- NEW: live logging handlers
+        self.btn_log_toggle.clicked.connect(self.toggle_live_logging)
+        self.spin_logN.valueChanged.connect(lambda v: setattr(self, 'log_every_n', int(v)))
 
         # RTSP grabber
         self.grabber = Grabber(STREAM_URL)
@@ -383,6 +448,9 @@ class DICLive(QtWidgets.QMainWindow):
             self.cum_disp = np.zeros((len(self.ref_pts),2), np.float32)
             self.frame_cnt = 0
             self.frozen = False
+            # --- NEW: reset export time series
+            self._export_start_time = time.time()
+            self.export_rows = []
             self.info.setText("Reference set")
         except Exception as e:
             self.info.setText(f"Ref error: {e}")
@@ -408,6 +476,73 @@ class DICLive(QtWidgets.QMainWindow):
             if ok and pix>0:
                 self.scale_mm = mm/pix
                 self.info.setText(f"Scale = {self.scale_mm:.6f} mm/pix")
+
+    # --- NEW: helper — average values along a line in ROI coords
+    def _avg_along_roi_line(self, field, rx1, ry1, rx2, ry2):
+        h, w = field.shape[:2]
+        n = max(2, int(np.hypot(rx2-rx1, ry2-ry1)) + 1)
+        xs = np.clip(np.round(np.linspace(rx1, rx2, n)).astype(int), 0, w-1)
+        ys = np.clip(np.round(np.linspace(ry1, ry2, n)).astype(int), 0, h-1)
+        vals = field[ys, xs]
+        vals = vals[np.isfinite(vals)]
+        if vals.size == 0:
+            return float('nan')
+        return float(np.mean(vals))
+
+    # --- NEW: export handler
+    def export_csv(self):
+        if not self.export_rows:
+            QtWidgets.QMessageBox.information(self, "Export", "No data captured yet. Make sure a gauge is set and a reference is active.")
+            return
+        fname, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save Gauge Averages", "gauge_averages.csv", "CSV Files (*.csv)")
+        if not fname:
+            return
+        header = list(self.export_rows[0].keys())
+        try:
+            with open(fname, 'w', newline='') as f:
+                writer = csv.DictWriter(f, fieldnames=header)
+                writer.writeheader()
+                for row in self.export_rows:
+                    writer.writerow(row)
+            self.info.setText(f"CSV saved → {fname}")
+        except Exception as e:
+            self.info.setText(f"CSV error: {e}")
+
+    # --- NEW: live logging toggle
+    def toggle_live_logging(self):
+        if not self.live_logging:
+            # preconditions
+            if self._export_start_time is None:
+                QtWidgets.QMessageBox.information(self, "Live Logging", "Set a reference first (and preferably a gauge line)." )
+                return
+            path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Live CSV Log", "gauge_live_log.csv", "CSV Files (*.csv)")
+            if not path:
+                return
+            header = [
+                "time_s","frame",
+                "exx_avg","eyy_avg","exy_avg","poisson_avg",
+                "equiv_strain_avg","principal_strain_avg",
+                "ux_avg_mm","uy_avg_mm","disp_total_avg_mm"
+            ]
+            try:
+                self.logger_thread = CSVWriterThread(path, header, self.log_queue)
+                self.logger_thread.start()
+                self.live_logging = True
+                self.btn_log_toggle.setText("Stop Live Logging")
+                self.info.setText(f"Live logging → {path}")
+            except Exception as e:
+                self.logger_thread = None
+                self.live_logging = False
+                self.info.setText(f"Log start error: {e}")
+        else:
+            try:
+                if self.logger_thread is not None:
+                    self.logger_thread.stop()
+                self.logger_thread = None
+            finally:
+                self.live_logging = False
+                self.btn_log_toggle.setText("Start Live Logging")
+                self.info.setText("Live logging stopped")
 
     def process(self):
         if self.cur is None:
@@ -492,27 +627,30 @@ class DICLive(QtWidgets.QMainWindow):
             duy_dx = np.gradient(uy,sp,axis=1)
             exy = 0.5*(dux_dy+duy_dx)
 
+            # also compute derived fields for export
+            with np.errstate(divide='ignore',invalid='ignore'):
+                poisson = -exx/(eyy+1e-12)
+                poisson[np.isnan(poisson)] = 0
+            eqv = np.sqrt(0.5*((exx-eyy)**2 + exx**2 + eyy**2) + 3*exy**2)
+            princ = 0.5*((exx+eyy) + np.sqrt((exx-eyy)**2+4*exy**2))
+            disp_tot = np.hypot(ux, uy)
             metric = self.combo_met.currentText()
             if metric=="Axial Strain":
-                field,unit = eyy,""
+                field,unit = eyy, ""
             elif metric=="Transverse Strain":
-                field,unit = exx,""
+                field,unit = exx, ""
             elif metric=="Poisson":
-                with np.errstate(divide='ignore',invalid='ignore'):
-                    field = -exx/(eyy+1e-12); field[np.isnan(field)] = 0
-                unit=""
+                field,unit = poisson, ""
             elif metric=="Equivalent Strain":
-                field = np.sqrt(0.5*((exx-eyy)**2 + exx**2 + eyy**2) + 3*exy**2)
-                unit=""
+                field,unit = eqv, ""
             elif metric=="Principal Strain":
-                field = 0.5*((exx+eyy) + np.sqrt((exx-eyy)**2+4*exy**2))
-                unit=""
+                field,unit = princ, ""
             elif metric=="Disp X (mm)":
-                field,unit = ux,"mm"
+                field,unit = ux, "mm"
             elif metric=="Disp Y (mm)":
-                field,unit = uy,"mm"
+                field,unit = uy, "mm"
             else:
-                field = np.hypot(ux, uy)
+                field = disp_tot
                 unit = "mm"
 
             # gauge line deformation
@@ -527,6 +665,43 @@ class DICLive(QtWidgets.QMainWindow):
                     p1 = (int(gx1+dp1x), int(gy1+dp1y))
                     p2 = (int(gx2+dp2x), int(gy2+dp2y))
                     cv2.line(vis, p1, p2, (0,255,255), 2)
+
+                    # --- NEW: capture gauge-line averages each frame
+                    if self._export_start_time is not None:
+                        # averages along the line in ROI coords
+                        ax = self._avg_along_roi_line(exx, rx1, ry1, rx2, ry2)
+                        ay = self._avg_along_roi_line(eyy, rx1, ry1, rx2, ry2)
+                        axy = self._avg_along_roi_line(exy, rx1, ry1, rx2, ry2)
+                        apois = self._avg_along_roi_line(poisson, rx1, ry1, rx2, ry2)
+                        aeqv = self._avg_along_roi_line(eqv, rx1, ry1, rx2, ry2)
+                        aprinc = self._avg_along_roi_line(princ, rx1, ry1, rx2, ry2)
+                        aux = self._avg_along_roi_line(ux, rx1, ry1, rx2, ry2)
+                        auy = self._avg_along_roi_line(uy, rx1, ry1, rx2, ry2)
+                        adisp = self._avg_along_roi_line(disp_tot, rx1, ry1, rx2, ry2)
+                        t_rel = now - self._export_start_time
+                        row = {
+                            "time_s": round(t_rel, 6),
+                            "frame": int(self.frame_cnt),
+                            "exx_avg": ax,
+                            "eyy_avg": ay,
+                            "exy_avg": axy,
+                            "poisson_avg": apois,
+                            "equiv_strain_avg": aeqv,
+                            "principal_strain_avg": aprinc,
+                            "ux_avg_mm": aux,
+                            "uy_avg_mm": auy,
+                            "disp_total_avg_mm": adisp
+                        }
+                        # store in-memory list (optional for post-export)
+                        self.export_rows.append(row)
+                        # push to logger queue if enabled, throttled by N frames
+                        if self.live_logging and (self.frame_cnt - self._last_logged_frame) >= self.log_every_n:
+                            try:
+                                self.log_queue.put_nowait(row)
+                                self._last_logged_frame = self.frame_cnt
+                            except Exception:
+                                # queue full → drop to avoid blocking DIC pipeline
+                                pass
 
             # auto/freeze scale
             if self.chk_auto.isChecked():
@@ -596,6 +771,12 @@ class DICLive(QtWidgets.QMainWindow):
             self.info.setText(traceback.format_exc())
 
     def closeEvent(self, ev):
+        # stop threads first
+        if self.logger_thread is not None:
+            try:
+                self.logger_thread.stop()
+            except Exception:
+                pass
         self.grabber.stop()
         if self.recorder:
             self.recorder.release()
