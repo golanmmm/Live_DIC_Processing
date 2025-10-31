@@ -184,7 +184,7 @@ class DICLive(QtWidgets.QMainWindow):
 
         # NEW: mesh‑warp controls
         self.chk_meshwarp = QtWidgets.QCheckBox("Mesh Warp (piecewise‑affine)"); self.chk_meshwarp.setChecked(True)
-        self.spin_meshstep = QtWidgets.QSpinBox(); self.spin_meshstep.setRange(8, 200); self.spin_meshstep.setValue(40)
+        self.spin_meshstep = QtWidgets.QSpinBox(); self.spin_meshstep.setRange(2, 200); self.spin_meshstep.setValue(40)
 
         # Layout – controls form
         form = QtWidgets.QFormLayout()
